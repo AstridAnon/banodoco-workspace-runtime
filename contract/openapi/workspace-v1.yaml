@@ -137,7 +137,7 @@ paths:
       description: Ingest bytes into runtime CAS and associate the resulting managed object with this project before task settlement.
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
-      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectObjectMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
@@ -898,6 +898,13 @@ components:
           additionalProperties: false
           required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
           properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
+    ProjectObjectMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/managed-object.json' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
     ProjectShotCreate:
       type: object
       additionalProperties: false
