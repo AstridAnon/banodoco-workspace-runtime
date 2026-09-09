@@ -1800,11 +1800,10 @@ class RuntimeService:
                 (project_row["id"], obj["digest"], timestamp),
             )
             row = dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone())
-            result = self._object_resource(row) | {
-                "project": project_row["id"],
-                "relation": "managed",
-                "deduplicated": obj["deduplicated"],
-            }
+            # The durable result is the closed managed-object resource.  The
+            # project association and CAS deduplication state remain durable
+            # transaction facts, not extra fields in the public object wire.
+            result = self._object_resource(row) | {"relation": "managed"}
             return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id=project_row["id"])
         except Exception:
             # The CAS write precedes the SQLite transaction.  If the durable
