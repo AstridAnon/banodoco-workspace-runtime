@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from runtime_protocol.backup import restore_backup, verify_backup
-from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
+from runtime_protocol.errors import CapabilityUnavailableError, ConflictError, LeaseError, ValidationError
 from runtime_protocol.daemon import RuntimeDaemon
 from http_helpers import Api
 from runtime_protocol.service import RuntimeService
@@ -260,12 +260,66 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
             _settle_attempt(service, stale_attempt, effect=stale_effect, idempotency_key="effect-settle-stale")
         service.cancel(stale)
 
-        valid_effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1}
+        valid_effect = {
+            "effect_type": "project.update",
+            "target_id": project["id"],
+            "expected_version": 1,
+            "payload": {"name": "Settled Effect"},
+        }
         duplicate = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": valid_effect, "idempotency_key": "effect-duplicate"})["task"]["id"]
         duplicate_attempt = _claim_attempt(service, idempotency_key="effect-claim-duplicate")
-        _settle_attempt(service, duplicate_attempt, effect=valid_effect, idempotency_key="effect-settle-duplicate")
+        settled = _settle_attempt(service, duplicate_attempt, effect=valid_effect, idempotency_key="effect-settle-duplicate")
+        assert settled["data"]["state"] == "succeeded"
+        assert service.get_project(project["id"])["name"] == "Settled Effect"
+        assert service.get_project(project["id"])["version"] == 2
+        replayed = _settle_attempt(service, duplicate_attempt, effect=valid_effect, idempotency_key="effect-settle-duplicate")
+        assert replayed == settled
+        assert service.get_project(project["id"])["version"] == 2
         with pytest.raises(LeaseError):
             _settle_attempt(service, duplicate_attempt, effect=valid_effect, idempotency_key="effect-settle-duplicate-retry")
+    finally:
+        service.close()
+
+
+def test_hc04_admission_rejects_unready_duplicate_and_foreign_inputs(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "owner", "name": "Owner"})
+        foreign_project = service.create_project({"slug": "foreign", "name": "Foreign"})
+        foreign_object = service.ingest(foreign_project["id"], b"foreign", idempotency_key="foreign-object")["data"]["object_id"]
+        digest = _digest("render.gpu-v1")
+        service.register_capability({
+            "capability_id": "render.gpu",
+            "definition_digest": digest,
+            "status": "unavailable",
+            "unavailable_reason": "model_missing",
+        })
+
+        with pytest.raises(CapabilityUnavailableError):
+            service.create_task({
+                "capability_id": "render.gpu",
+                "capability_digest": digest,
+                "project": project["id"],
+                "idempotency_key": "unready-admission",
+            }, enforce_readiness=True)
+
+        with pytest.raises(ValidationError, match="unique"):
+            service.create_task({
+                "capability_id": "render.gpu",
+                "capability_digest": digest,
+                "project": project["id"],
+                "input_object_ids": [foreign_object, foreign_object],
+                "idempotency_key": "duplicate-inputs",
+            })
+
+        with pytest.raises(ConflictError, match="not associated"):
+            service.create_task({
+                "capability_id": "render.gpu",
+                "capability_digest": digest,
+                "project": project["id"],
+                "input_object_ids": [foreign_object],
+                "idempotency_key": "foreign-input",
+            })
     finally:
         service.close()
 
