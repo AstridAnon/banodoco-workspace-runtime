@@ -655,7 +655,7 @@ components:
         required_facts: { $ref: './schemas/task.json#/definitions/RequiredFacts' }
         project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
-        settlement_effect: { type: object, additionalProperties: true }
+        settlement_effect: { $ref: './schemas/worker.json#/definitions/Effect' }
         storage_estimate: { $ref: '#/components/schemas/StorageEstimate' }
     StorageEstimate:
       type: object

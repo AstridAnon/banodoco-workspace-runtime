@@ -125,6 +125,12 @@
       }
     },
     "Effect": {
+      "anyOf": [
+        { "$ref": "#/definitions/ProjectUpdateEffect" },
+        { "$ref": "#/definitions/GenerationVariantAppendEffect" }
+      ]
+    },
+    "ProjectUpdateEffect": {
       "type": "object", "additionalProperties": false,
       "required": ["effect_type", "target_id", "expected_version", "payload"],
       "properties": {
@@ -132,6 +138,28 @@
         "target_id": { "type": "string", "minLength": 1 },
         "expected_version": { "type": "integer", "minimum": 1 },
         "payload": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "GenerationVariantAppendEffect": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effect_type", "target_id", "expected_version", "payload"],
+      "properties": {
+        "effect_type": { "type": "string", "const": "generation.variant.append" },
+        "target_id": { "type": "string", "minLength": 1, "description": "Target generation id." },
+        "expected_version": { "type": "integer", "minimum": 1, "description": "Expected target generation version." },
+        "payload": { "$ref": "#/definitions/GenerationVariantAppendPayload" }
+      }
+    },
+    "GenerationVariantAppendPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_variant_id", "source_object_id", "variant_type", "output_name", "output_ordinal", "primary_policy"],
+      "properties": {
+        "source_variant_id": { "type": "string", "minLength": 1 },
+        "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "variant_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "output_name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "output_ordinal": { "type": "integer", "minimum": 0 },
+        "primary_policy": { "type": "string", "const": "preserve" }
       }
     }
   }

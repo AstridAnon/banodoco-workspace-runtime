@@ -1318,7 +1318,7 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 
-    def _validate_settlement_effect(self, effect):
+    def _validate_settlement_effect(self, effect, *, project_id=None, result=None):
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
         kind = effect.get("effect_type")
@@ -1328,8 +1328,15 @@ class RealmStore:
             expected_version = int(expected)
         except (TypeError, ValueError) as exc:
             raise ValidationError("settlement effect expected_version must be a positive integer") from exc
-        if kind != "project.update" or not target or expected is None or expected_version < 1:
-            raise ValidationError("settlement effect requires effect_type=project.update, target_id, and positive expected_version")
+        if not target or expected is None or expected_version < 1:
+            raise ValidationError("settlement effect requires target_id and positive expected_version")
+        if kind == "generation.variant.append":
+            self._validate_generation_variant_append_effect(
+                effect, project_id=project_id, result=result,
+            )
+            return
+        if kind != "project.update":
+            raise ValidationError("unsupported settlement effect_type")
         try:
             current = self._project(str(target))
         except NotFoundError as exc:
@@ -1337,10 +1344,168 @@ class RealmStore:
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
 
-    def _apply_settlement_effect(self, effect):
+    def _validate_generation_variant_append_effect(self, effect, *, project_id=None, result=None):
+        """Validate the narrow, Runtime-owned generation append contract.
+
+        This is intentionally stricter than the legacy project update effect.
+        The generation, source variant, source object, and selected output are
+        all bound before any variant row or generation version is changed.
+        """
+        if not isinstance(effect.get("target_id"), str) or not effect["target_id"]:
+            raise ValidationError("generation.variant.append target_id must be a non-empty string")
+        expected_version = effect.get("expected_version")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("generation.variant.append expected_version must be a positive integer")
+        payload = effect.get("payload")
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.variant.append payload must be an object")
+        required = {
+            "source_variant_id", "source_object_id", "variant_type",
+            "output_name", "output_ordinal", "primary_policy",
+        }
+        unknown = sorted(set(payload) - required)
+        missing = sorted(required - set(payload))
+        if missing or unknown:
+            raise ValidationError(
+                "generation.variant.append payload has the wrong fields",
+                details={"missing": missing, "unexpected": unknown},
+            )
+        source_variant_id = payload["source_variant_id"]
+        if not isinstance(source_variant_id, str) or not source_variant_id:
+            raise ValidationError("source_variant_id must be a non-empty string")
+        source_object_id = payload["source_object_id"]
+        if not isinstance(source_object_id, str) or not OBJECT_ID_RE.fullmatch(source_object_id):
+            raise ValidationError("source_object_id must be a canonical sha256 object id")
+        if not source_object_id.startswith("sha256:"):
+            raise ValidationError("source_object_id must include the sha256 prefix")
+        source_digest = source_object_id.removeprefix("sha256:")
+        variant_type = payload["variant_type"]
+        if not isinstance(variant_type, str) or not variant_type or len(variant_type) > 128:
+            raise ValidationError("variant_type must be a non-empty string of at most 128 characters")
+        output_name = payload["output_name"]
+        if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
+            raise ValidationError("output_name must be a non-empty string of at most 512 characters")
+        output_ordinal = payload["output_ordinal"]
+        if isinstance(output_ordinal, bool) or not isinstance(output_ordinal, int) or output_ordinal < 0:
+            raise ValidationError("output_ordinal must be a non-negative integer")
+        if payload["primary_policy"] != "preserve":
+            raise ValidationError("primary_policy must be preserve")
+
+        # Shape-only validation is used at admission/settlement request
+        # parsing. The ownership and custody checks require the task project
+        # and the normalized staged result, and therefore run again below.
+        if project_id is None and result is None:
+            return
+        if not project_id:
+            raise ConflictError("generation.variant.append requires a project-scoped task")
+        generation = self.conn.execute(
+            "SELECT * FROM generations WHERE id=?", (str(effect["target_id"]),)
+        ).fetchone()
+        if not generation:
+            raise NotFoundError("settlement effect target generation not found", details={"target_id": effect["target_id"]})
+        if generation["project_id"] != str(project_id):
+            raise ConflictError(
+                "settlement effect generation is outside the task project",
+                details={"target_id": effect["target_id"], "project_id": project_id},
+            )
+        if int(generation["version"]) != int(effect["expected_version"]):
+            raise ConflictError(
+                "stale settlement effect target generation version",
+                details={"target": effect["target_id"], "expected": int(effect["expected_version"]), "actual": int(generation["version"])},
+            )
+        source_variant = self.conn.execute(
+            "SELECT * FROM generation_variants WHERE id=?", (source_variant_id,)
+        ).fetchone()
+        if not source_variant or source_variant["generation_id"] != generation["id"]:
+            raise ConflictError(
+                "source variant does not belong to the target generation",
+                details={"source_variant_id": source_variant_id, "target_id": generation["id"]},
+            )
+        if source_variant["object_id"] != source_digest:
+            raise ConflictError(
+                "source variant object does not match source_object_id",
+                details={"source_variant_id": source_variant_id, "expected": source_variant["object_id"], "actual": source_digest},
+            )
+        if not self.conn.execute("SELECT 1 FROM objects WHERE digest=?", (source_digest,)).fetchone():
+            raise ConflictError("source object is not present in Runtime CAS", details={"source_object_id": source_object_id})
+        if not self.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (str(project_id), source_digest),
+        ).fetchone():
+            raise ConflictError(
+                "source object is outside the task project",
+                details={"project_id": project_id, "source_object_id": source_object_id},
+            )
+        if result is None:
+            return
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValidationError("generation.variant.append requires exactly one settlement output")
+        selected = outputs[0]
+        if (
+            not isinstance(selected, dict)
+            or selected.get("name") != output_name
+            or output_ordinal != 0
+            or selected.get("kind") != "object"
+            or not isinstance(selected.get("digest"), str)
+            or not OBJECT_ID_RE.fullmatch(selected["digest"])
+        ):
+            raise ValidationError(
+                "generation.variant.append output selector did not resolve exactly one object",
+                details={"output_name": output_name, "output_ordinal": output_ordinal},
+            )
+
+    def _apply_settlement_effect(self, effect, *, project_id=None, result=None):
         kind = effect.get("effect_type")
         if kind != "project.update":
-            raise ValidationError("unsupported settlement effect_type")
+            if kind != "generation.variant.append":
+                raise ValidationError("unsupported settlement effect_type")
+            self._validate_settlement_effect(effect, project_id=project_id, result=result)
+            payload = effect["payload"]
+            output = result["outputs"][payload["output_ordinal"]]
+            output_digest = output["digest"].removeprefix("sha256:")
+            identity = {
+                "generation_id": str(effect["target_id"]),
+                "source_variant_id": payload["source_variant_id"],
+                "source_object_id": payload["source_object_id"],
+                "variant_type": payload["variant_type"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "output_digest": output["digest"],
+            }
+            variant_id = "append-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+            timestamp = now()
+            changed = self.conn.execute(
+                "UPDATE generations SET version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
+                (timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
+            )
+            if changed.rowcount != 1:
+                raise ConflictError("stale settlement effect target generation version")
+            metadata = {
+                "source_variant_id": payload["source_variant_id"],
+                "source_object_id": payload["source_object_id"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "primary_policy": payload["primary_policy"],
+            }
+            try:
+                self.conn.execute(
+                    "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (variant_id, str(effect["target_id"]), output_digest, payload["variant_type"], canonical_json(metadata), timestamp),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError(
+                    "generation variant append conflicts with an existing variant",
+                    details={"variant_id": variant_id},
+                ) from exc
+            return {
+                "variant_id": variant_id,
+                "generation_id": str(effect["target_id"]),
+                "object_id": output["digest"],
+                "variant_type": payload["variant_type"],
+                "metadata": metadata,
+                "created_at": timestamp,
+            }
         target = effect.get("target_id")
         current = self._project(str(target))
         payload = effect.get("payload") or {}
@@ -1374,17 +1539,33 @@ class RealmStore:
                 raise ValidationError("settlement effect was not predeclared", details={"declared": declared})
             if declared is not None and effect is None:
                 raise ValidationError("declared settlement effect is required")
-            if effect is not None:
-                self._validate_settlement_effect(effect)
+            run = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+            task_project_id = run["project_id"] if run else None
             with self._transaction():
                 timestamp = now()
-                if effect is not None:
-                    self._apply_settlement_effect(effect)
                 # The service stages output bytes before entering this fenced
                 # transaction.  Publication and object/project metadata are
                 # performed only after all lease/effect checks succeeded.
+                if effect is not None:
+                    self._validate_settlement_effect(effect, project_id=task_project_id, result=result)
+                applied_effect = None
+                append_effect = effect is not None and effect.get("effect_type") == "generation.variant.append"
                 if publish is not None:
+                    if append_effect:
+                        # Variant rows reference CAS objects.  Publish first
+                        # inside this transaction, then append the variant;
+                        # rollback plus staged cleanup removes all new bytes
+                        # if the append or receipt fails. project.update keeps
+                        # its historical effect-before-publication ordering.
+                        publish()
+                if effect is not None:
+                    applied_effect = self._apply_settlement_effect(
+                        effect, project_id=task_project_id, result=result,
+                    )
+                if publish is not None and not append_effect:
                     publish()
+                if applied_effect is not None:
+                    result["generation_variant"] = applied_effect
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
