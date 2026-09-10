@@ -154,6 +154,7 @@ def test_generation_variant_append_is_atomic_and_replays_deterministically(tmp_p
         appended = variants[1]
         assert appended["variant_type"] == "magic_edit"
         assert appended["object_id"] == _digest(output)
+        assert appended["metadata"]["source_task_id"] == fixture["task"]["task"]["id"]
         assert service.store.conn.execute(
             "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
             (fixture["project"]["id"], _digest(output).removeprefix("sha256:")),
