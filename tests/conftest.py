@@ -56,7 +56,14 @@ def stage1_runtime_environment(tmp_path_factory: pytest.TempPathFactory) -> Path
         wheels = sorted(wheelhouse.glob("*.whl"))
         if len(wheels) != 2:
             raise RuntimeError(f"expected two local Stage 1 wheels, found {len(wheels)}")
-        subprocess.run([str(pip), "install", "--no-index", "--no-deps", *(str(wheel) for wheel in wheels)], check=True)
+        # The prepared interpreter may carry an editable checkout of this
+        # project.  Force-install the exact wheels into the fresh child venv so
+        # pip cannot mistake that outer editable metadata for an installed
+        # package and silently omit one of the two runtime components.
+        subprocess.run(
+            [str(pip), "install", "--no-index", "--no-deps", "--force-reinstall", *(str(wheel) for wheel in wheels)],
+            check=True,
+        )
         yield environment
     finally:
         for path, was_present in existed.items():
