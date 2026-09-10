@@ -1396,7 +1396,7 @@ class RealmStore:
         if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
             raise ValidationError("output_name must be a non-empty string of at most 512 characters")
         output_ordinal = payload["output_ordinal"]
-        if isinstance(output_ordinal, bool) or output_ordinal != 0:
+        if isinstance(output_ordinal, bool) or not isinstance(output_ordinal, int) or output_ordinal != 0:
             raise ValidationError("output_ordinal must be zero for generation.variant.append")
         if payload["primary_policy"] != "preserve":
             raise ValidationError("primary_policy must be preserve")
