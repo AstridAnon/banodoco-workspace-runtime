@@ -110,7 +110,7 @@ def _page_cursor(scope, key):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
+def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn, skip_after=None):
     limit, decoded = _page_args(cursor, limit)
     if decoded is not None and decoded.get("s") != scope:
         raise InvalidRequestError("cursor does not belong to this collection")
@@ -122,8 +122,8 @@ def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
             if len(key) != len(after):
                 raise InvalidRequestError("cursor is invalid")
             try:
-                before = key <= after
-            except TypeError as exc:
+                before = skip_after(key, after) if skip_after is not None else key <= after
+            except (TypeError, IndexError) as exc:
                 raise InvalidRequestError("cursor is invalid") from exc
             if before:
                 continue
@@ -1647,10 +1647,14 @@ class RuntimeService:
 
     def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at DESC, id ASC", (project["id"],)).fetchall()
         return _page_rows(rows, scope=f"generations:{project['id']}", cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
-                          resource_fn=self._generation_resource)
+                          resource_fn=self._generation_resource,
+                          skip_after=lambda key, after: (
+                              key[0] > after[0]
+                              or (key[0] == after[0] and key[1] <= after[1])
+                          ))
 
     def get_generation(self, generation_id):
         row = self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone()
