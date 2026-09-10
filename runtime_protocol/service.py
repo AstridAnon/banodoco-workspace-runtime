@@ -16,6 +16,7 @@ import stat
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Mapping
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
@@ -72,6 +73,12 @@ def _wire_object(body, *, required=(), allowed=()):
     if unknown:
         raise ValidationError("request body contains unsupported fields", details={"fields": unknown})
     return body
+
+
+def _require_runtime_epoch_for_lease(body):
+    """Classify an omitted epoch as stale lease state, not request shape."""
+    if isinstance(body, dict) and "runtime_epoch" not in body:
+        raise LeaseError("runtime epoch is required")
 
 
 def _page_args(cursor, limit):
@@ -2140,6 +2147,7 @@ class RuntimeService:
         claim namespace.  The request hash binds executor, capabilities, and
         runtime epoch; a replay can never consume a second queued task.
         """
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("executor_id", "capability_ids", "runtime_epoch"),
@@ -2207,6 +2215,7 @@ class RuntimeService:
             raise ConflictError("attempt_id does not match the attempt path")
         body["attempt_id"] = str(attempt_id)
         _wire_string(body, "lease_id")
+        _require_runtime_epoch_for_lease(body)
         # Keep a numerically typed stale fence on the lease path. A worker
         # presenting fence 0 (or another old fence) is a fenced lease error,
         # not a request-shape error; this preserves one guard taxonomy.
@@ -2756,8 +2765,10 @@ class RuntimeService:
                 raise LeaseError("attempt lease deadline is invalid") from exc
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
+        raw_body = {} if body is None else body
+        _require_runtime_epoch_for_lease(raw_body)
         body = _wire_object(
-            {} if body is None else body,
+            raw_body,
             required=("attempt_id", "lease_id", "fence", "runtime_epoch"),
             allowed=("attempt_id", "lease_id", "fence", "runtime_epoch"),
         )
@@ -2994,6 +3005,7 @@ class RuntimeService:
 
     def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),
@@ -3034,6 +3046,7 @@ class RuntimeService:
 
     def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),

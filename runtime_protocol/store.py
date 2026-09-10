@@ -419,6 +419,9 @@ class RealmStore:
         if version == 19:
             self._run_executor_authority_migration()
             return
+        if version == 21:
+            self._run_executor_identity_migration()
+            return
         script = matches[0].read_text(encoding="utf-8")
         self.conn.executescript("BEGIN IMMEDIATE;\n" + script + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\nCOMMIT;")
 
@@ -490,6 +493,17 @@ class RealmStore:
                 self.conn.execute("DROP TABLE workers")
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (19, datetime('now'))"
+            )
+
+    def _run_executor_identity_migration(self):
+        """Add executor identity columns to partially upgraded realms once."""
+        with self._transaction():
+            executor_columns = self._table_columns("executors")
+            for column in ("source_digest", "dependency_digest", "source_epoch"):
+                if column not in executor_columns:
+                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} TEXT")
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (21, datetime('now'))"
             )
 
     def close(self):
