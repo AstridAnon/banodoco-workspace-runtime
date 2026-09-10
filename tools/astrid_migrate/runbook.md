@@ -4,6 +4,15 @@ This runbook is explicit: choose one source and one selected neutral realm.
 These commands never guess a source, stop a process by name, combine project
 trees, or delete source data.
 
+## Unified-execution relationship
+
+The B12 migration/realm runbook is distinct from task admission. Runtime and
+the selected neutral realm remain the authority for Astrid tasks, runs,
+receipts, and settlement; Reigh/Supabase legacy task lifecycle paths are not
+accepted as a migration shortcut or execution authority. Validate the
+unified-execution CPU boundary and its receipts before considering any GPU or
+historical-corpus operation.
+
 ## Preflight and dry run
 
 For routine Stage 1 proof, use the tiny live acceptance fixture. It creates a
