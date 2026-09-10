@@ -1318,7 +1318,7 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 
-    def _validate_settlement_effect(self, effect, *, project_id=None, result=None):
+    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None):
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
         kind = effect.get("effect_type")
@@ -1332,7 +1332,10 @@ class RealmStore:
             raise ValidationError("settlement effect requires target_id and positive expected_version")
         if kind == "generation.variant.append":
             self._validate_generation_variant_append_effect(
-                effect, project_id=project_id, result=result,
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
             )
             return
         if kind != "project.update":
@@ -1344,7 +1347,14 @@ class RealmStore:
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
 
-    def _validate_generation_variant_append_effect(self, effect, *, project_id=None, result=None):
+    def _validate_generation_variant_append_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        input_object_ids=None,
+    ):
         """Validate the narrow, Runtime-owned generation append contract.
 
         This is intentionally stricter than the legacy project update effect.
@@ -1386,8 +1396,8 @@ class RealmStore:
         if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
             raise ValidationError("output_name must be a non-empty string of at most 512 characters")
         output_ordinal = payload["output_ordinal"]
-        if isinstance(output_ordinal, bool) or not isinstance(output_ordinal, int) or output_ordinal < 0:
-            raise ValidationError("output_ordinal must be a non-negative integer")
+        if isinstance(output_ordinal, bool) or output_ordinal != 0:
+            raise ValidationError("output_ordinal must be zero for generation.variant.append")
         if payload["primary_policy"] != "preserve":
             raise ValidationError("primary_policy must be preserve")
 
@@ -1436,6 +1446,11 @@ class RealmStore:
                 "source object is outside the task project",
                 details={"project_id": project_id, "source_object_id": source_object_id},
             )
+        if not isinstance(input_object_ids, list) or source_object_id not in input_object_ids:
+            raise ConflictError(
+                "source object is not an admitted task input",
+                details={"source_object_id": source_object_id},
+            )
         if result is None:
             return
         outputs = result.get("outputs") if isinstance(result, dict) else None
@@ -1455,12 +1470,25 @@ class RealmStore:
                 details={"output_name": output_name, "output_ordinal": output_ordinal},
             )
 
-    def _apply_settlement_effect(self, effect, *, project_id=None, result=None):
+    def _apply_settlement_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        task_id=None,
+        input_object_ids=None,
+    ):
         kind = effect.get("effect_type")
         if kind != "project.update":
             if kind != "generation.variant.append":
                 raise ValidationError("unsupported settlement effect_type")
-            self._validate_settlement_effect(effect, project_id=project_id, result=result)
+            self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
             payload = effect["payload"]
             output = result["outputs"][payload["output_ordinal"]]
             output_digest = output["digest"].removeprefix("sha256:")
@@ -1472,6 +1500,7 @@ class RealmStore:
                 "output_name": payload["output_name"],
                 "output_ordinal": payload["output_ordinal"],
                 "output_digest": output["digest"],
+                "task_id": str(task_id),
             }
             variant_id = "append-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
             timestamp = now()
@@ -1535,6 +1564,8 @@ class RealmStore:
                 except ValueError as exc:
                     raise LeaseError("attempt lease deadline is invalid") from exc
             declared = json.loads(task["expected_effect_json"]) if task["expected_effect_json"] else None
+            task_spec = json.loads(task["spec_json"] or "{}")
+            input_object_ids = task_spec.get("input_object_ids", [])
             if effect is not None and declared != effect:
                 raise ValidationError("settlement effect was not predeclared", details={"declared": declared})
             if declared is not None and effect is None:
@@ -1547,7 +1578,12 @@ class RealmStore:
                 # transaction.  Publication and object/project metadata are
                 # performed only after all lease/effect checks succeeded.
                 if effect is not None:
-                    self._validate_settlement_effect(effect, project_id=task_project_id, result=result)
+                    self._validate_settlement_effect(
+                        effect,
+                        project_id=task_project_id,
+                        result=result,
+                        input_object_ids=input_object_ids,
+                    )
                 applied_effect = None
                 append_effect = effect is not None and effect.get("effect_type") == "generation.variant.append"
                 if publish is not None:
@@ -1560,7 +1596,11 @@ class RealmStore:
                         publish()
                 if effect is not None:
                     applied_effect = self._apply_settlement_effect(
-                        effect, project_id=task_project_id, result=result,
+                        effect,
+                        project_id=task_project_id,
+                        result=result,
+                        task_id=task_id,
+                        input_object_ids=input_object_ids,
                     )
                 if publish is not None and not append_effect:
                     publish()

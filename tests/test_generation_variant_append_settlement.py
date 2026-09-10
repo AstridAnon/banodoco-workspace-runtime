@@ -29,7 +29,15 @@ def _output(value: bytes, *, name: str = "generated_images") -> dict:
     }
 
 
-def _setup(service: RuntimeService, *, slug: str = "edit", effect_override: dict | None = None, mismatched_source: bool = False) -> dict:
+def _setup(
+    service: RuntimeService,
+    *,
+    slug: str = "edit",
+    effect_override: dict | None = None,
+    mismatched_source: bool = False,
+    missing_admitted_source: bool = False,
+    different_admitted_source: bool = False,
+) -> dict:
     capability_digest = _digest(CAPABILITY)
     executor_id = f"worker-{slug}"
     service.register_executor(
@@ -42,6 +50,10 @@ def _setup(service: RuntimeService, *, slug: str = "edit", effect_override: dict
     source = service.ingest(project["id"], b"source-image", idempotency_key=f"source-{slug}")
     source_object_id = source["data"]["digest"]
     effect_source_object_id = source_object_id
+    alternate_object_id = None
+    if different_admitted_source:
+        alternate = service.ingest(project["id"], b"different-admitted-source", idempotency_key=f"different-source-{slug}")
+        alternate_object_id = alternate["data"]["digest"]
     if mismatched_source:
         alternate = service.ingest(project["id"], b"other-source", idempotency_key=f"other-source-{slug}")
         effect_source_object_id = alternate["data"]["digest"]
@@ -76,12 +88,18 @@ def _setup(service: RuntimeService, *, slug: str = "edit", effect_override: dict
         },
     }
     admitted_effect = effect_override or effect
+    if missing_admitted_source:
+        input_object_ids = []
+    elif different_admitted_source:
+        input_object_ids = [alternate_object_id]
+    else:
+        input_object_ids = [source_object_id]
     task = service.create_task(
         {
             "capability_id": CAPABILITY,
             "capability_digest": capability_digest,
             "project": project["id"],
-            "input_object_ids": [source_object_id],
+            "input_object_ids": input_object_ids,
             "settlement_effect": admitted_effect,
             "idempotency_key": f"task-{slug}",
         }
@@ -183,6 +201,28 @@ def test_generation_variant_append_rejects_source_variant_object_mismatch(tmp_pa
         service.close()
 
 
+@pytest.mark.parametrize("setup_kwargs", [{"missing_admitted_source": True}, {"different_admitted_source": True}])
+def test_generation_variant_append_requires_the_lineage_source_as_an_admitted_input(tmp_path, setup_kwargs):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _setup(service, slug="admitted-source", **setup_kwargs)
+        with pytest.raises(ConflictError, match="not an admitted task input"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [_output(b"unadmitted-lineage-output")],
+                key="unadmitted-lineage-settle",
+                effect=fixture["effect"],
+            )
+        digest = _digest(b"unadmitted-lineage-output").removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone() is None
+        assert service.get_generation(fixture["generation_id"])["version"] == 1
+        assert len(service.list_variants(fixture["generation_id"])["items"]) == 1
+    finally:
+        service.close()
+
+
 def test_generation_variant_append_rejects_stale_generation_version_without_mutation(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
@@ -238,5 +278,56 @@ def test_generation_variant_append_rolls_back_after_publication_failure(tmp_path
         assert service.get_generation(fixture["generation_id"])["version"] == 1
         assert len(service.list_variants(fixture["generation_id"])["items"]) == 1
         assert service.store.conn.execute("SELECT status FROM tasks WHERE id=?", (fixture["task"]["task"]["id"],)).fetchone()[0] == "running"
+    finally:
+        service.close()
+
+
+def test_generation_variant_append_scopes_distinct_tasks_with_identical_output_bytes(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _setup(service, slug="identical-output")
+        output = b"same-generated-image"
+        first = _settle(
+            service,
+            fixture["attempt"],
+            [_output(output)],
+            key="first-identical-output-settle",
+            effect=fixture["effect"],
+        )
+
+        second_effect = {
+            **fixture["effect"],
+            "expected_version": 2,
+        }
+        second_task = service.create_task(
+            {
+                "capability_id": CAPABILITY,
+                "capability_digest": _digest(CAPABILITY),
+                "project": fixture["project"]["id"],
+                "input_object_ids": [fixture["source_object_id"]],
+                "settlement_effect": second_effect,
+                "idempotency_key": "second-identical-output-task",
+            }
+        )
+        second_attempt = service.claim_next(
+            {
+                "executor_id": "worker-identical-output",
+                "capability_ids": [CAPABILITY],
+                "runtime_epoch": service.health()["runtime_epoch"],
+            },
+            idempotency_key="second-identical-output-claim",
+        )
+        second = _settle(
+            service,
+            second_attempt,
+            [_output(output)],
+            key="second-identical-output-settle",
+            effect=second_effect,
+        )
+
+        assert first["data"]["result"]["generation_variant"]["variant_id"] != second["data"]["result"]["generation_variant"]["variant_id"]
+        assert service.get_generation(fixture["generation_id"])["version"] == 3
+        assert len(service.list_variants(fixture["generation_id"])["items"]) == 3
+        assert service.store.conn.execute("SELECT status FROM tasks WHERE id=?", (second_task["task"]["id"],)).fetchone()[0] == "completed"
     finally:
         service.close()
