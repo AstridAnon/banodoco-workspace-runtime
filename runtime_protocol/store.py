@@ -1336,6 +1336,14 @@ class RealmStore:
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
         kind = effect.get("effect_type")
+        if kind == "generation.create_with_variant":
+            self._validate_generation_create_with_variant_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            return
         target = effect.get("target_id")
         expected = effect.get("expected_version")
         try:
@@ -1360,6 +1368,92 @@ class RealmStore:
             raise NotFoundError("settlement effect target project not found", details={"target_id": target}) from exc
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
+
+    def _validate_generation_create_with_variant_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        input_object_ids=None,
+    ):
+        """Validate Runtime-owned creation of a generation and first variant.
+
+        This is the new-generation counterpart to ``generation.variant.append``.
+        The task project is the sole target authority; Runtime derives stable
+        generation/variant identities from the admitted task at settlement.
+        That lets upload-driven producers publish into the gallery atomically
+        without a browser-side generation-create mutation.
+        """
+        if not isinstance(effect.get("target_id"), str) or not effect["target_id"]:
+            raise ValidationError("generation.create_with_variant target_id must be a non-empty string")
+        payload = effect.get("payload")
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.create_with_variant payload must be an object")
+        required = {
+            "generation_type", "metadata", "variant_type",
+            "output_name", "output_ordinal", "primary_policy",
+        }
+        unknown = sorted(set(payload) - required)
+        missing = sorted(required - set(payload))
+        if missing or unknown:
+            raise ValidationError(
+                "generation.create_with_variant payload has the wrong fields",
+                details={"missing": missing, "unexpected": unknown},
+            )
+        generation_type = payload["generation_type"]
+        if not isinstance(generation_type, str) or not generation_type or len(generation_type) > 128:
+            raise ValidationError("generation_type must be a non-empty string of at most 128 characters")
+        metadata = payload["metadata"]
+        if not isinstance(metadata, dict):
+            raise ValidationError("generation metadata must be an object")
+        if "params" in metadata and not isinstance(metadata["params"], dict):
+            raise ValidationError("generation.create_with_variant metadata.params must be an object")
+        variant_type = payload["variant_type"]
+        if not isinstance(variant_type, str) or not variant_type or len(variant_type) > 128:
+            raise ValidationError("variant_type must be a non-empty string of at most 128 characters")
+        output_name = payload["output_name"]
+        if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
+            raise ValidationError("output_name must be a non-empty string of at most 512 characters")
+        if isinstance(payload["output_ordinal"], bool) or payload["output_ordinal"] != 0:
+            raise ValidationError("output_ordinal must be zero for generation.create_with_variant")
+        if payload["primary_policy"] != "preserve":
+            raise ValidationError("primary_policy must be preserve")
+
+        # Shape-only validation is used before output staging. Project and
+        # input custody checks run again inside the fenced settlement.
+        if project_id is None and result is None:
+            return
+        if not project_id:
+            raise ConflictError("generation.create_with_variant requires a project-scoped task")
+        target_project = self._project(str(effect["target_id"]))
+        if target_project["id"] != str(project_id):
+            raise ConflictError(
+                "generation.create_with_variant target project does not match the task project",
+                details={"target_id": effect["target_id"], "project_id": project_id},
+            )
+        # The producer-facing contract admits either the Runtime project ID or
+        # its canonical slug.  Settlement remains Runtime-owned: the resolved
+        # project ID is used for the generation row below.
+        if not isinstance(input_object_ids, list) or not input_object_ids:
+            raise ConflictError("generation.create_with_variant requires admitted task inputs")
+        if result is None:
+            return
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValidationError("generation.create_with_variant requires exactly one settlement output")
+        selected = outputs[0]
+        if (
+            not isinstance(selected, dict)
+            or selected.get("name") != output_name
+            or selected.get("kind") != "object"
+            or not isinstance(selected.get("digest"), str)
+            or not OBJECT_ID_RE.fullmatch(selected["digest"])
+        ):
+            raise ValidationError(
+                "generation.create_with_variant output selector did not resolve exactly one object",
+                details={"output_name": output_name, "output_ordinal": 0},
+            )
 
     def _validate_generation_variant_append_effect(
         self,
@@ -1494,6 +1588,83 @@ class RealmStore:
         input_object_ids=None,
     ):
         kind = effect.get("effect_type")
+        if kind == "generation.create_with_variant":
+            self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            payload = effect["payload"]
+            output = result["outputs"][payload["output_ordinal"]]
+            output_digest = output["digest"].removeprefix("sha256:")
+            generation_id = "generation-task-" + str(task_id)
+            identity = {
+                "generation_id": generation_id,
+                "variant_type": payload["variant_type"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "output_digest": output["digest"],
+                "task_id": str(task_id),
+            }
+            variant_id = "initial-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+            timestamp = now()
+            generation_metadata = dict(payload["metadata"])
+            params = generation_metadata.get("params", {})
+            if not isinstance(params, dict):
+                raise ValidationError("generation.create_with_variant metadata.params must be an object")
+            params = dict(params)
+            params["source_task_id"] = str(task_id)
+            params["input_object_ids"] = list(input_object_ids or [])
+            params["output_name"] = payload["output_name"]
+            params.setdefault("content_type", "video" if "video" in payload["generation_type"].lower() else "image")
+            generation_metadata["params"] = params
+            generation_metadata["source_task_id"] = str(task_id)
+            generation_metadata["input_object_ids"] = list(input_object_ids or [])
+            generation_metadata["output_name"] = payload["output_name"]
+            generation_metadata["output_ordinal"] = payload["output_ordinal"]
+            generation_metadata["primary_policy"] = payload["primary_policy"]
+            self.conn.execute(
+                "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
+                (
+                    generation_id,
+                    str(project_id),
+                    str(task_id),
+                    payload["generation_type"],
+                    canonical_json(generation_metadata),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            variant_metadata = {
+                "is_primary": True,
+                "source_task_id": str(task_id),
+                "input_object_ids": list(input_object_ids or []),
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "primary_policy": payload["primary_policy"],
+                "media_type": output.get("media_type"),
+                "size": output.get("size"),
+            }
+            self.conn.execute(
+                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    variant_id,
+                    generation_id,
+                    output_digest,
+                    payload["variant_type"],
+                    canonical_json(variant_metadata),
+                    timestamp,
+                ),
+            )
+            return {
+                "variant_id": variant_id,
+                "generation_id": generation_id,
+                "object_id": output["digest"],
+                "variant_type": payload["variant_type"],
+                "metadata": variant_metadata,
+                "created_at": timestamp,
+            }
         if kind != "project.update":
             if kind != "generation.variant.append":
                 raise ValidationError("unsupported settlement effect_type")
@@ -1600,7 +1771,10 @@ class RealmStore:
                         input_object_ids=input_object_ids,
                     )
                 applied_effect = None
-                append_effect = effect is not None and effect.get("effect_type") == "generation.variant.append"
+                append_effect = effect is not None and effect.get("effect_type") in {
+                    "generation.variant.append",
+                    "generation.create_with_variant",
+                }
                 if publish is not None:
                     if append_effect:
                         # Variant rows reference CAS objects.  Publish first

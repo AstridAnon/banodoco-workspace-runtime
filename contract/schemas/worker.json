@@ -128,7 +128,8 @@
     "Effect": {
       "anyOf": [
         { "$ref": "#/definitions/ProjectUpdateEffect" },
-        { "$ref": "#/definitions/GenerationVariantAppendEffect" }
+        { "$ref": "#/definitions/GenerationVariantAppendEffect" },
+        { "$ref": "#/definitions/GenerationCreateWithVariantEffect" }
       ]
     },
     "ProjectUpdateEffect": {
@@ -157,6 +158,27 @@
       "properties": {
         "source_variant_id": { "type": "string", "minLength": 1 },
         "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "variant_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "output_name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "output_ordinal": { "type": "integer", "const": 0 },
+        "primary_policy": { "type": "string", "const": "preserve" }
+      }
+    },
+    "GenerationCreateWithVariantEffect": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effect_type", "target_id", "payload"],
+      "properties": {
+        "effect_type": { "type": "string", "const": "generation.create_with_variant" },
+        "target_id": { "type": "string", "minLength": 1, "description": "Target project id." },
+        "payload": { "$ref": "#/definitions/GenerationCreateWithVariantPayload" }
+      }
+    },
+    "GenerationCreateWithVariantPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generation_type", "metadata", "variant_type", "output_name", "output_ordinal", "primary_policy"],
+      "properties": {
+        "generation_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "metadata": { "type": "object", "additionalProperties": true },
         "variant_type": { "type": "string", "minLength": 1, "maxLength": 128 },
         "output_name": { "type": "string", "minLength": 1, "maxLength": 512 },
         "output_ordinal": { "type": "integer", "const": 0 },
