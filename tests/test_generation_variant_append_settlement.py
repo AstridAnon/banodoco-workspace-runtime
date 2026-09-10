@@ -315,6 +315,30 @@ def test_generation_create_with_variant_cancelled_task_publishes_nothing(tmp_pat
         service.close()
 
 
+def test_generation_create_with_variant_rejects_late_settlement_after_cancel(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(service, slug="character-cancel-late")
+        service.cancel_task_canonical(
+            fixture["task"]["task"]["id"],
+            {},
+            idempotency_key="cancel-character-late",
+        )
+        with pytest.raises(LeaseError, match="stale or already settled"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [_video_output(b"late-cancelled-output")],
+                key="late-cancelled-settle",
+                effect=fixture["effect"],
+            )
+        digest = _digest(b"late-cancelled-output").removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.list_generations(fixture["project"]["id"])["items"] == []
+    finally:
+        service.close()
+
+
 def test_generation_create_with_variant_rejects_foreign_project_target(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
