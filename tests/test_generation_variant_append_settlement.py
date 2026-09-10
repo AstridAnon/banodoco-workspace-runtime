@@ -223,6 +223,39 @@ def test_generation_variant_append_requires_the_lineage_source_as_an_admitted_in
         service.close()
 
 
+def test_generation_variant_append_rejects_non_integer_zero_ordinal_before_publication(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        effect = {
+            "effect_type": "generation.variant.append",
+            "target_id": "generation-ordinal",
+            "expected_version": 1,
+            "payload": {
+                "source_variant_id": "source-variant-ordinal",
+                "source_object_id": "sha256:" + ("0" * 64),
+                "variant_type": "magic_edit",
+                "output_name": "generated_images",
+                "output_ordinal": 0.0,
+                "primary_policy": "preserve",
+            },
+        }
+        fixture = _setup(service, slug="ordinal", effect_override=effect)
+        with pytest.raises(ValidationError, match="output_ordinal must be zero"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [_output(b"non-integer-ordinal-output")],
+                key="non-integer-ordinal-settle",
+                effect=fixture["effect"],
+            )
+        digest = _digest(b"non-integer-ordinal-output").removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.get_generation(fixture["generation_id"])["version"] == 1
+        assert len(service.list_variants(fixture["generation_id"])["items"]) == 1
+    finally:
+        service.close()
+
+
 def test_generation_variant_append_rejects_stale_generation_version_without_mutation(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
