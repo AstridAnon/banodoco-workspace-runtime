@@ -112,6 +112,7 @@ def _setup(
         },
         idempotency_key=f"claim-{slug}",
     )
+    assert attempt["expected_effect"] == admitted_effect
     return {
         "project": project,
         "source_object_id": source_object_id,

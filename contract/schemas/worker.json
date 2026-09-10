@@ -76,6 +76,7 @@
         "runtime_epoch": { "type": "integer", "minimum": 1 },
         "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "spec": { "type": "object", "additionalProperties": true },
+        "expected_effect": { "$ref": "#/definitions/Effect" },
         "required_facts": { "$ref": "#/definitions/VerifiedFacts" },
         "storage_estimate": {
           "type": "object", "additionalProperties": false,

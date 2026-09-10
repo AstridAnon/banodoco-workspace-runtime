@@ -2197,6 +2197,8 @@ class RuntimeService:
             # must execute exactly what was claimed, without a racy second read.
             admitted_spec = dict(task.get("spec") or {})
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if task.get("expected_effect") is not None:
+                result["expected_effect"] = dict(task["expected_effect"])
             if "required_facts" in admitted_spec:
                 result["required_facts"] = dict(admitted_spec["required_facts"])
             if "storage_estimate" in admitted_spec:
