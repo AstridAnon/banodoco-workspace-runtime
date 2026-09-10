@@ -5,6 +5,8 @@ intentionally pure so the same bytes are produced on a retry and the runtime
 does not need to invent product-specific queue state.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping, Sequence
 from typing import Any
 
