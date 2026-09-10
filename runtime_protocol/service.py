@@ -2,22 +2,25 @@ from __future__ import annotations
 
 from .cas import ContentAddressedStore
 from .backup import create_backup, restore_backup, structured_export
-from .store import RealmStore, normalize_execution_facts
+from .store import OBJECT_ID_RE, RealmStore, normalize_execution_facts
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 import hashlib
 import json
 import sqlite3
 import base64
+import copy
 import os
 import re
+import subprocess
 import uuid
 import stat
+import math
+from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Mapping
-from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
+from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
@@ -33,6 +36,7 @@ TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
 TEXT_BINDING_MAX_BYTES = 1_048_576
 TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
+MEDIA_PROBE_TIMEOUT_SECONDS = 10
 
 
 def validate_idempotency_key(value):
@@ -76,9 +80,65 @@ def _wire_object(body, *, required=(), allowed=()):
 
 
 def _require_runtime_epoch_for_lease(body):
-    """Classify an omitted epoch as stale lease state, not request shape."""
+    """Reject an omitted epoch as malformed request data before any lookup."""
     if isinstance(body, dict) and "runtime_epoch" not in body:
-        raise LeaseError("runtime epoch is required")
+        raise ValidationError(
+            "request body is missing required fields",
+            details={"fields": ["runtime_epoch"]},
+        )
+
+
+def _probe_media_bytes(data):
+    """Return verified stream facts for media bytes without a metadata service."""
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-print_format", "json",
+                "-show_entries", "stream=codec_type,duration:format=duration",
+                "-i", "pipe:0",
+            ],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=MEDIA_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationError("source media could not be verified") from exc
+    if completed.returncode != 0:
+        raise ValidationError("source media is malformed")
+    try:
+        value = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("source media probe returned malformed metadata") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("streams"), list) or not value["streams"]:
+        raise ValidationError("source media has no streams")
+    stream_types = []
+    durations = {}
+    for stream in value["streams"]:
+        if not isinstance(stream, dict) or not isinstance(stream.get("codec_type"), str):
+            raise ValidationError("source media stream metadata is malformed")
+        stream_type = stream["codec_type"]
+        stream_types.append(stream_type)
+        raw_duration = stream.get("duration")
+        if raw_duration is not None and raw_duration not in ("N/A", ""):
+            try:
+                duration = float(raw_duration)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("source media duration is malformed") from exc
+            if not math.isfinite(duration) or duration < 0:
+                raise ValidationError("source media duration is malformed")
+            durations.setdefault(stream_type, duration)
+    raw_format_duration = (value.get("format") or {}).get("duration") if isinstance(value.get("format"), dict) else None
+    format_duration = None
+    if raw_format_duration is not None and raw_format_duration not in ("N/A", ""):
+        try:
+            format_duration = float(raw_format_duration)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("source media duration is malformed") from exc
+        if not math.isfinite(format_duration) or format_duration < 0:
+            raise ValidationError("source media duration is malformed")
+    return {"stream_types": tuple(stream_types), "durations": durations, "format_duration": format_duration}
 
 
 def _page_args(cursor, limit):
@@ -135,11 +195,22 @@ def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn, skip_after=No
     return {"items": [resource for _, resource in selected], "next_cursor": _page_cursor(scope, selected[-1][0]) if has_more else None}
 
 
+def _verified_mutation(function):
+    """Fence the complete mutation against a concurrent admission loss."""
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        with self.store._mutex:
+            self._assert_mutation_admitted()
+            return function(self, *args, **kwargs)
+    return wrapped
+
+
 def _durable_mutation(function):
     """Keep a B7 project mutation and its idempotency receipt atomic."""
     @wraps(function)
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
+            self._assert_mutation_admitted()
             try:
                 with self.store._transaction():
                     result = function(self, *args, **kwargs)
@@ -158,11 +229,26 @@ class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None):
-        self.store = RealmStore(root)
-        self.cas = ContentAddressedStore(self.store.cas_root)
-        self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
-        self.runtime_session_id = new_id()
-        self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+        self.store = RealmStore(root, strict_admission=True)
+        self._verified = False
+        self._admission_failure = None
+        try:
+            if not self.store.admission_report.get("ok"):
+                raise RealmAdmissionError(
+                    "realm failed startup admission",
+                    details=self.store.admission_report,
+                )
+            self.cas = ContentAddressedStore(self.store.cas_root)
+            self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
+            report = self.store.doctor()
+            if not report.get("ok"):
+                raise RealmAdmissionError("realm is not usable after initialization", details=report)
+            self.runtime_session_id = new_id()
+            self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+            self._verified = True
+        except Exception:
+            self.store.close()
+            raise
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
         self.reboot_executor = reboot_executor
         configured_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
@@ -193,12 +279,22 @@ class RuntimeService:
         return value
 
     def doctor(self):
-        return self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+        with self.store._mutex:
+            report = self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+            if not report.get("ok"):
+                # Admission is monotonic for one service instance. Repair is
+                # verified by a fresh startup; an unhealthy process never
+                # silently resumes writes after observing damaged authority.
+                self._verified = False
+                self._admission_failure = report
+            return report
 
+    @_verified_mutation
     def tombstone(self, body=None):
         body = body or {}
         return self.store.tombstone_realm(reason=body.get("reason"), expected_version=body.get("expected_version"))
 
+    @_verified_mutation
     def recover_realm(self, body=None):
         body = body or {}
         # Recovery is a destructive lifecycle transition.  Require an
@@ -231,7 +327,15 @@ class RuntimeService:
         raise ConflictError("whole-realm purge is offline-only; stop the runtime and use the purge command", details={"next_action": "banodoco-runtime purge --root <realm> --confirm 'PURGE <realm_id>'"})
 
     def health(self):
-        return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+        report = self.doctor()
+        return {"status": "ok" if self._verified and report.get("ok") else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+
+    def _assert_mutation_admitted(self):
+        if not self._verified:
+            raise RealmAdmissionError(
+                "realm is not admitted for mutations",
+                details=self._admission_failure or self.store.admission_report,
+            )
 
     def runtime_lifecycle(self):
         """Return current boot/session and recovery facts for diagnostics."""
@@ -285,6 +389,7 @@ class RuntimeService:
             return
         self._assert_executor_identity(identity, row["executor_id"])
 
+    @_verified_mutation
     def create_project(self, body, *, idempotency_key=None):
         name = str(body.get("name") or "")
         slug = str(body.get("slug") or "-".join(name.lower().split()))
@@ -300,6 +405,7 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=lambda row: self._project_resource(self.store.get_project(row["id"])))
 
+    @_verified_mutation
     def select_project(self, actor_id, selector, *, scope="workspace", idempotency_key=None):
         value = self.store.select_project(actor_id, selector, scope, idempotency_key=idempotency_key)
         return {
@@ -318,6 +424,7 @@ class RuntimeService:
             "updated_at": value["updated_at"],
         }
 
+    @_verified_mutation
     def update_project(self, selector, body, *, idempotency_key=None):
         return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"), idempotency_key=idempotency_key)
 
@@ -359,6 +466,56 @@ class RuntimeService:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValidationError("expected_version must be a positive integer")
         return value
+
+    def _verified_source_media(self, source, digest, *, clip_type, track_kind=None):
+        """Verify immutable bytes and the stream needed by the selected clip."""
+        path = self.cas.path_for(digest)
+        if path.is_symlink() or not path.is_file():
+            raise ConflictError("managed source media is unavailable")
+        try:
+            data = self.cas.read(digest)
+        except (NotFoundError, ConflictError) as exc:
+            raise ConflictError("managed source media failed immutable verification") from exc
+        try:
+            expected_size = int(source["size"])
+        except (TypeError, ValueError) as exc:
+            raise ConflictError("managed source media metadata is malformed") from exc
+        if path.is_symlink() or len(data) != expected_size:
+            raise ConflictError("managed source media failed immutable verification")
+        media_type = source["media_type"]
+        if not isinstance(media_type, str) or not media_type:
+            raise ValidationError("managed source media type is malformed")
+        media_type = media_type.split(";", 1)[0].strip().lower()
+        if "/" not in media_type:
+            raise ValidationError("managed source media type is malformed")
+        expected_stream = {"image": "video", "video": "video", "audio": "audio"}.get(clip_type)
+        if expected_stream is None and clip_type == "media":
+            # A generic media clip inherits its stream from the canonical
+            # track. Visual tracks are video by definition; never let the
+            # replacement MIME type silently turn one into an audio clip.
+            expected_stream = "audio" if track_kind in {"audio", "sound"} else "video"
+        if expected_stream not in {"video", "audio"}:
+            raise ValidationError("selected clip has an unsupported media stream")
+        if media_type.split("/", 1)[0] not in {"application", "binary"}:
+            declared_stream = "video" if media_type.startswith("image/") else media_type.split("/", 1)[0]
+            if declared_stream != expected_stream:
+                raise ValidationError("source media stream does not match selected clip")
+        probe = _probe_media_bytes(data)
+        if expected_stream not in probe["stream_types"]:
+            raise ValidationError("source media stream does not match selected clip")
+        duration = probe["durations"].get(expected_stream, probe["format_duration"])
+        return data, expected_stream, duration
+
+    @staticmethod
+    def _authored_clip_interval(clip):
+        start, end = clip.get("from"), clip.get("to")
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            raise ValidationError("selected clip must have a numeric authored interval")
+        if not math.isfinite(float(start)) or not math.isfinite(float(end)) or end <= start:
+            raise ValidationError("selected clip must have a positive authored interval")
+        if start < 0:
+            raise ValidationError("selected clip must have a non-negative authored source offset")
+        return float(start), float(end)
 
     @_durable_mutation
     def update_timeline(self, timeline_id, body, *, idempotency_key=None):
@@ -411,6 +568,128 @@ class RuntimeService:
             event_id = self.store._append_timeline_event(timeline_id, "timeline.updated", {"project_id": project_id, "version": resource["version"]})
             event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
             return self._command_record("timeline.update", timeline_id, idempotency_key, request_hash, resource, project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
+
+    @_durable_mutation
+    def replace_timeline_clip(self, timeline_id, body, *, idempotency_key=None):
+        """Replace one canonical composition clip with a project-owned object."""
+        self._require_object_body(body)
+        unexpected = set(body) - {"clip_id", "source_object_id", "expected_version", "timing"}
+        if unexpected:
+            raise ValidationError("replacement request contains unsupported fields", details={"fields": sorted(unexpected)})
+        expected = self._expected_version(body)
+        clip_id = body.get("clip_id")
+        source_object_id = body.get("source_object_id")
+        timing = body.get("timing", "preserve-duration")
+        if not isinstance(clip_id, str) or not clip_id:
+            raise ValidationError("clip_id is required")
+        if not isinstance(source_object_id, str) or not source_object_id:
+            raise ValidationError("source_object_id is required")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_object_id):
+            raise ValidationError("source_object_id must be a canonical SHA-256 object id")
+        if timing != "preserve-duration":
+            raise ValidationError("timing must be preserve-duration")
+
+        timeline = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
+        if not timeline:
+            raise NotFoundError("timeline not found")
+        project_id = str(timeline["project_id"])
+        request = {
+            "timeline_id": timeline_id,
+            "clip_id": clip_id,
+            "source_object_id": source_object_id,
+            "expected_version": expected,
+            "timing": timing,
+        }
+        request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+        replay = self._command_replay("timeline.clip.replace", timeline_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+
+        document_id = f"timeline:{timeline_id}"
+        document = self.store.conn.execute(
+            "SELECT * FROM project_documents WHERE id=? AND project_id=?",
+            (document_id, project_id),
+        ).fetchone()
+        if not document:
+            raise NotFoundError("timeline composition document not found")
+        if int(document["version"]) != expected:
+            raise ConflictError("timeline composition version conflict", details={"expected": expected, "actual": int(document["version"])})
+
+        digest = source_object_id.removeprefix("sha256:")
+        source = self.store.conn.execute(
+            "SELECT objects.* FROM objects JOIN project_objects ON project_objects.digest=objects.digest "
+            "WHERE objects.digest=? AND project_objects.project_id=? AND project_objects.relation='managed'",
+            (digest, project_id),
+        ).fetchone()
+        if not source:
+            raise NotFoundError("managed source object not found in timeline project", details={"source_object_id": source_object_id, "project_id": project_id})
+
+        content = json.loads(document["content_json"])
+        config = content.get("config") if isinstance(content, dict) else None
+        registry = content.get("registry") if isinstance(content, dict) else None
+        clips = config.get("clips") if isinstance(config, dict) else None
+        assets = registry.get("assets") if isinstance(registry, dict) else None
+        if not isinstance(clips, list):
+            raise ValidationError("timeline config.clips must be a list")
+        if not isinstance(assets, dict):
+            raise ValidationError("timeline registry.assets must be an object")
+        matches = [clip for clip in clips if isinstance(clip, dict) and clip.get("id") == clip_id]
+        if len(matches) != 1:
+            raise ValidationError("clip_id must identify exactly one clip", details={"clip_id": clip_id, "match_count": len(matches)})
+        target = matches[0]
+        if target.get("clipType", "media") not in {"media", "image", "video", "audio"}:
+            raise ValidationError("selected clip is not a media clip", details={"clip_id": clip_id})
+        old_asset_id = target.get("asset")
+        if not isinstance(old_asset_id, str) or not isinstance(assets.get(old_asset_id), Mapping):
+            raise ValidationError("selected clip must reference an existing registry asset", details={"clip_id": clip_id})
+
+        clip_type = str(target.get("clipType", "media")).lower()
+        _, authored_source_end = self._authored_clip_interval(target)
+        track_kind = None
+        track_id = target.get("track")
+        tracks = config.get("tracks", []) if isinstance(config, dict) else []
+        if isinstance(tracks, list):
+            for track in tracks:
+                if isinstance(track, dict) and track.get("id") == track_id:
+                    track_kind = str(track.get("kind") or "").lower()
+                    break
+        _, _, source_duration = self._verified_source_media(source, digest, clip_type=clip_type, track_kind=track_kind)
+        if (clip_type != "image" and source_duration is None) or (source_duration is not None and source_duration + 1e-6 < authored_source_end):
+            raise ValidationError("source media is too short for preserve-duration", details={"required_source_end": authored_source_end, "source_duration": source_duration})
+
+        changed_content = copy.deepcopy(content)
+        changed_config = changed_content["config"]
+        changed_registry = changed_content["registry"]
+        changed_target = next(clip for clip in changed_config["clips"] if isinstance(clip, dict) and clip.get("id") == clip_id)
+        canonical_object_id = "sha256:" + digest
+        existing = changed_registry["assets"].get(canonical_object_id)
+        asset_entry = {
+            "media_id": canonical_object_id,
+            "content_sha256": digest,
+            "type": str(source["media_type"]),
+        }
+        if existing is not None and existing != asset_entry:
+            raise ConflictError("source object id collides with a different registry asset", details={"source_object_id": canonical_object_id})
+        changed_registry["assets"][canonical_object_id] = asset_entry
+        changed_target["asset"] = canonical_object_id
+
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE project_documents SET content_json=?, version=?, updated_at=? WHERE id=? AND project_id=?",
+            (canonical_json(changed_content), expected + 1, timestamp, document_id, project_id),
+        )
+        resource = self._timeline_resource(timeline_id)
+        event_id = self.store._append_timeline_event(
+            timeline_id,
+            "timeline.clip.replaced",
+            {"project_id": project_id, "clip_id": clip_id, "source_object_id": canonical_object_id, "config_version": expected + 1},
+        )
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+        return self._command_record(
+            "timeline.clip.replace", timeline_id, idempotency_key, request_hash, resource,
+            project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id,
+            resulting_stream_seq=event_seq,
+        )
 
     @_durable_mutation
     def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):
@@ -1716,6 +1995,7 @@ class RuntimeService:
         if not row: raise NotFoundError("reference not found")
         return self._reference_resource(row)
 
+    @_verified_mutation
     def _update_shot_state(self, shot_id, body, *, archived=None, idempotency_key=None):
         expected = self._expected_version(body)
         with self.store._mutex:
@@ -1746,6 +2026,7 @@ class RuntimeService:
     def archive_shot(self, shot_id, body, *, idempotency_key=None): return self._update_shot_state(shot_id, body, archived=True, idempotency_key=idempotency_key)
     def recover_shot(self, shot_id, body, *, idempotency_key=None): return self._update_shot_state(shot_id, body, archived=False, idempotency_key=idempotency_key)
 
+    @_verified_mutation
     def _update_reference_state(self, reference_id, body, *, archived=None, idempotency_key=None):
         expected = self._expected_version(body)
         with self.store._mutex:
@@ -1928,6 +2209,7 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["from_digest"]), str(row["to_digest"]), str(row["kind"]), int(row["ordinal"])),
                           resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
+    @_verified_mutation
     def create_task(self, body, *, enforce_readiness=False):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
@@ -1971,9 +2253,11 @@ class RuntimeService:
             resource["result"] = task["result"]
         return resource
 
+    @_verified_mutation
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
+    @_verified_mutation
     def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
@@ -1996,6 +2280,7 @@ class RuntimeService:
                 self.store.cancel_task(task_id, record=record)
                 return recorded
 
+    @_verified_mutation
     def retry_task(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
@@ -2020,6 +2305,7 @@ class RuntimeService:
                 self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
                 event_id = self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
+                self.store._refresh_continuations_for_predecessor(task_id)
                 result = self._task_resource(self.store.get_task(task_id))
                 event_seq = self.store.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (current["run"]["id"],)).fetchone()[0]
                 return self._command_record("task.retry", task_id, idempotency_key, request_hash, result, project_id=project_id, event_ids=(event_id,), primary_stream_id=current["run"]["id"], resulting_stream_seq=event_seq)
@@ -2027,9 +2313,11 @@ class RuntimeService:
     def events(self, run_id):
         return self.store.list_events(run_id)
 
+    @_verified_mutation
     def cancel_run(self, run_id, body=None, *, idempotency_key=None):
         return self._run_resource(self.store.cancel_run(run_id, idempotency_key=idempotency_key))
 
+    @_verified_mutation
     def retry_run(self, run_id, body=None, *, idempotency_key=None):
         body = body or {}
         return self._run_resource(self.store.retry_run(run_id, selected_task_ids=body.get("selected_task_ids"), idempotency_key=idempotency_key))
@@ -2041,10 +2329,14 @@ class RuntimeService:
         return result
 
     def list_capabilities(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
-        rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
-        return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
-                          key_fn=lambda row: (str(row["id"]),),
-                          resource_fn=lambda r: self._capability_resource(r))
+        # Registration updates capability descriptors and executor visibility
+        # in one transaction. Readers share the same fence so the HTTP catalog
+        # cannot observe the transaction halfway through.
+        with self.store._mutex:
+            rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
+            return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
+                              key_fn=lambda row: (str(row["id"]),),
+                              resource_fn=lambda r: self._capability_resource(r))
 
     def _capability_resource(self, row):
         status = row["status"]
@@ -2053,6 +2345,7 @@ class RuntimeService:
             status, reason = "unavailable", "no_live_matching_executor"
         return {"capability_id": row["id"], "definition_digest": row["definition_digest"], "status": status, "required_resource_keys": json.loads(row["required_resource_keys_json"]), "estimated_scratch_bytes": row["estimated_scratch_bytes"], "estimated_output_bytes": row["estimated_output_bytes"], "unavailable_reason": reason}
 
+    @_verified_mutation
     def register_capability(self, body):
         value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
         # Registration acknowledges the executor's declared state. Discovery
@@ -2285,6 +2578,176 @@ class RuntimeService:
             finally:
                 self._discard_staged_outputs(staged)
 
+    @_verified_mutation
+    def publish_timeline_render(self, attempt_id, body, *, idempotency_key=None, identity=None):
+        """Publish one canonical timeline revision and its render task once.
+
+        The checkpoint is keyed by the authoring task rather than an attempt,
+        so an exact retry may resume after a worker crash.  Every unfinished
+        publication must still present the task's current live attempt fence.
+        """
+        require_idempotency_key(idempotency_key)
+        body = dict(_wire_object(
+            body,
+            required=("lease_id", "fence", "runtime_epoch", "timeline_id", "expected_version", "config", "registry", "render"),
+            allowed=("lease_id", "fence", "runtime_epoch", "timeline_id", "expected_version", "config", "registry", "render", "slug", "name"),
+        ))
+        _wire_string(body, "lease_id")
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        timeline_id = _wire_string(body, "timeline_id")
+        expected_version = self._expected_version(body)
+        config, registry, render = body["config"], body["registry"], body["render"]
+        if not isinstance(config, dict) or not isinstance(registry, dict) or not isinstance(render, dict):
+            raise ValidationError("config, registry, and render must be objects")
+        allowed_render = {"capability_id", "capability_digest", "schema_version", "spec", "storage_estimate", "settlement_effect"}
+        unknown_render = sorted(set(render) - allowed_render)
+        if unknown_render:
+            raise ValidationError("render contains unsupported fields", details={"fields": unknown_render})
+        if render.get("capability_id") != "rendering.render":
+            raise ValidationError("publication render capability must be rendering.render")
+        render_digest = _wire_string(render, "capability_digest")
+        render_spec = render.get("spec")
+        if not isinstance(render_spec, dict):
+            raise ValidationError("render.spec must be an object")
+        frozen = {
+            "timeline_id": timeline_id,
+            "expected_version": expected_version,
+            "config": config,
+            "registry": registry,
+            "render": render,
+            "slug": body.get("slug"),
+            "name": body.get("name"),
+        }
+        request_hash = hashlib.sha256(canonical_json(frozen).encode()).hexdigest()
+
+        with self.store._mutex:
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(attempt, identity)
+            current_epoch = self.store._current_runtime_epoch()
+            task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone() if attempt else None
+            authoring_task_id = str(task["id"]) if task else ""
+            existing = self.store.timeline_render_publication(authoring_task_id) if authoring_task_id else None
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise ConflictError("authoring task publication payload changed")
+                if existing["state"] == "published":
+                    return existing["result"]
+            self._validate_attempt_lease(attempt, body, current_epoch)
+            if not task or task["status"] != "running" or task["attempt_id"] != attempt_id:
+                raise LeaseError("attempt lease is stale or already settled")
+            dependency_count = self.store.conn.execute(
+                "SELECT COUNT(*) FROM task_dependencies WHERE continuation_task_id=?", (authoring_task_id,)
+            ).fetchone()[0]
+            admitted = self.store.conn.execute(
+                "SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (authoring_task_id,)
+            ).fetchone()
+            if dependency_count != 2 or admitted is None:
+                raise ValidationError("timeline publication requires an admitted two-child continuation")
+            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+            timeline = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
+            if not timeline:
+                raise NotFoundError("timeline not found")
+            if timeline["project_id"] != project_id:
+                raise ConflictError("timeline is outside the authoring task project")
+            self.store.prepare_timeline_render_publication(
+                authoring_task_id, attempt_id, body["fence"], body["runtime_epoch"], request_hash, frozen
+            )
+
+            # Revalidate after the separately committed prepare checkpoint.
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._validate_attempt_lease(attempt, body, self.store._current_runtime_epoch())
+            task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (authoring_task_id,)).fetchone()
+            if not task or task["status"] != "running" or task["attempt_id"] != attempt_id:
+                raise LeaseError("attempt lease is stale or already settled")
+
+            with self.store._transaction():
+                checkpoint = self.store.timeline_render_publication(authoring_task_id)
+                if checkpoint["state"] == "published":
+                    return checkpoint["result"]
+                document_id = f"timeline:{timeline_id}"
+                document = self.store.conn.execute(
+                    "SELECT * FROM project_documents WHERE id=? AND project_id=?", (document_id, project_id)
+                ).fetchone()
+                if not document:
+                    raise NotFoundError("timeline document not found")
+                if int(document["version"]) != expected_version:
+                    raise ConflictError("timeline document version conflict", details={"expected": expected_version, "actual": int(document["version"])})
+                content = json.loads(document["content_json"])
+                content.update({"config": config, "registry": registry})
+                if body.get("slug") is not None:
+                    content["slug"] = body["slug"]
+                if body.get("name") is not None:
+                    content["name"] = body["name"]
+                timeline_version = expected_version + 1
+                timestamp = now()
+                self.store.conn.execute(
+                    "UPDATE project_documents SET content_json=?, version=?, updated_at=? WHERE id=? AND project_id=?",
+                    (canonical_json(content), timeline_version, timestamp, document_id, project_id),
+                )
+                timeline_event_id = self.store._append_timeline_event(
+                    timeline_id, "timeline.document.saved",
+                    {"project_id": project_id, "document_id": document_id, "config_version": timeline_version, "authoring_task_id": authoring_task_id},
+                )
+
+                admitted_spec = copy.deepcopy(render_spec)
+                inputs = admitted_spec.setdefault("inputs", {})
+                if not isinstance(inputs, dict):
+                    raise ValidationError("render.spec.inputs must be an object")
+                supplied_ref = inputs.get("timeline_ref")
+                if supplied_ref not in (None, timeline_id, content.get("slug")):
+                    raise ConflictError("render timeline_ref does not identify the published timeline")
+                supplied_version = inputs.get("expected_version")
+                if supplied_version not in (None, timeline_version):
+                    raise ConflictError("render expected_version does not match the published timeline")
+                inputs.update({
+                    "timeline_ref": timeline_id,
+                    "expected_version": timeline_version,
+                    "timeline_snapshot": {
+                        "timeline_id": timeline_id, "project_id": project_id,
+                        "config_version": timeline_version, "config": config, "registry": registry,
+                    },
+                })
+                input_object_ids = []
+                assets = registry.get("assets") if isinstance(registry.get("assets"), dict) else {}
+                for asset in assets.values():
+                    if not isinstance(asset, dict):
+                        continue
+                    candidate = next((asset.get(key) for key in ("object_id", "media_id", "content_sha256", "digest", "sha256", "hash") if isinstance(asset.get(key), str) and OBJECT_ID_RE.fullmatch(asset.get(key))), None)
+                    if candidate is not None and candidate not in input_object_ids:
+                        input_object_ids.append(candidate)
+                task_spec = {
+                    "input_object_ids": input_object_ids,
+                    "schema_version": render.get("schema_version", "1"),
+                    "capability_digest": render_digest,
+                    "spec": admitted_spec,
+                }
+                if "storage_estimate" in render:
+                    task_spec["storage_estimate"] = self.store._validate_storage_estimate(render["storage_estimate"])
+                render_key = f"timeline-publication-{authoring_task_id}"
+                render_value = self.store.create_task(
+                    "rendering.render", task_spec, project_id, render_key,
+                    render.get("settlement_effect"), render_digest, enforce_readiness=True,
+                )
+                render_task_id = render_value["task"]["id"]
+                render_run_id = render_value["run"]["id"]
+                author_event_id = self.store._append_event(
+                    task["run_id"], authoring_task_id, "task.timeline_render_published",
+                    {"timeline_id": timeline_id, "timeline_version": timeline_version, "render_task_id": render_task_id, "render_run_id": render_run_id},
+                )
+                result = {
+                    "checkpoint_state": "published", "authoring_task_id": authoring_task_id,
+                    "timeline_id": timeline_id, "timeline_version": timeline_version,
+                    "render_task_id": render_task_id, "render_run_id": render_run_id,
+                    "timeline_event_id": timeline_event_id, "authoring_event_id": author_event_id,
+                }
+                self.store.complete_timeline_render_publication(
+                    authoring_task_id, attempt_id=attempt_id, fence=body["fence"], runtime_epoch=body["runtime_epoch"],
+                    timeline_id=timeline_id, timeline_version=timeline_version,
+                    render_task_id=render_task_id, render_run_id=render_run_id, result=result,
+                )
+                return result
+
     def _stage_outputs(self, attempt_id, outputs, *, project_id=None):
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
@@ -2300,7 +2763,7 @@ class RuntimeService:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
-                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64"}
+                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary", "duration_seconds"}
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
@@ -2381,6 +2844,23 @@ class RuntimeService:
                             os.close(root_fd)
                     if declared_size is not None and declared_size != size:
                         raise ValidationError("output size does not match CAS bytes")
+                ordinal = output.get("ordinal")
+                if ordinal is not None and (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0):
+                    raise ValidationError("output ordinal must be a non-negative integer")
+                role = output.get("role")
+                if role is not None and (not isinstance(role, str) or not role or len(role) > 255 or any(ord(char) < 32 for char in role)):
+                    raise ValidationError("output role is invalid")
+                is_primary = output.get("is_primary")
+                if is_primary is not None and not isinstance(is_primary, bool):
+                    raise ValidationError("output is_primary must be a boolean")
+                duration_seconds = output.get("duration_seconds")
+                if duration_seconds is not None and (
+                    isinstance(duration_seconds, bool)
+                    or not isinstance(duration_seconds, (int, float))
+                    or not math.isfinite(float(duration_seconds))
+                    or float(duration_seconds) <= 0
+                ):
+                    raise ValidationError("output duration_seconds must be a positive finite number")
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
@@ -2390,6 +2870,14 @@ class RuntimeService:
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
+                if ordinal is not None:
+                    normalized["ordinal"] = ordinal
+                if role is not None:
+                    normalized["role"] = role
+                if is_primary is not None:
+                    normalized["is_primary"] = is_primary
+                if duration_seconds is not None:
+                    normalized["duration_seconds"] = duration_seconds
                 staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
             return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
@@ -2769,6 +3257,7 @@ class RuntimeService:
                     raise LeaseError("attempt lease has expired")
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
+    @_verified_mutation
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
         raw_body = {} if body is None else body
@@ -2801,6 +3290,7 @@ class RuntimeService:
         expires_in = max(0, int((datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).total_seconds()))
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "executor_id": row["executor_id"], "runtime_epoch": current, "nonce": nonce, "expires_in_seconds": expires_in}
 
+    @_verified_mutation
     def checkpoint_attempt(self, attempt_id, body, *, identity=None):
         """Persist a bounded, fsync'd R1 checkpoint before a reboot request."""
         body = _wire_object(
@@ -2881,6 +3371,7 @@ class RuntimeService:
         # intentionally called after commit (it may block or terminate the
         # process), but no competing request can pass the claim meanwhile.
         with self.store._mutex:
+            self._assert_mutation_admitted()
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
             self._assert_attempt_identity(row, identity)
@@ -2944,6 +3435,7 @@ class RuntimeService:
                 self.store.conn.execute("UPDATE recovery_checkpoints SET state='executed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state='reboot_requested'", (canonical_json(receipt), now(), row["id"]))
         return receipt
 
+    @_verified_mutation
     def resume_attempt(self, body, *, identity=None):
         body = _wire_object(
             body,
@@ -3009,6 +3501,7 @@ class RuntimeService:
 
     resume = resume_attempt
 
+    @_verified_mutation
     def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         _require_runtime_epoch_for_lease(body)
@@ -3050,6 +3543,7 @@ class RuntimeService:
             self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
             return recorded
 
+    @_verified_mutation
     def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         _require_runtime_epoch_for_lease(body)

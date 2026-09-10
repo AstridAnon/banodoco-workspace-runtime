@@ -65,7 +65,9 @@ class RuntimeDaemon:
         self.thread = None
         self.catalog = RealmCatalog(self.support_root / "catalog.json")
         self.discovery = LiveDiscovery(self.support_root / "discovery.json")
-        self.credentials = CredentialStore(_authority_path(self.support_root / "credentials", "credential root"))
+        # CredentialStore creates its directory. Defer that side effect until
+        # the realm has passed RuntimeService's fenced startup admission.
+        self.credentials = None
         self.token = None
         self.worker_token = None
         self.credential_path = None
@@ -82,6 +84,7 @@ class RuntimeDaemon:
         if self.httpd:
             return self
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist)
+        self.credentials = CredentialStore(_authority_path(self.support_root / "credentials", "credential root"))
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
         self.worker_token, self.worker_credential_path = self.credentials.provision(WORKER_ACTOR, list(WORKER_SCOPES))
         if not self.production_worker_credentials:

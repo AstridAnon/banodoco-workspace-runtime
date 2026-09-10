@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .daemon import RuntimeDaemon, WORKER_SCOPES
 from .backup import create_backup, restore_backup, structured_export
+from .errors import RuntimeErrorBase
 from .store import RealmStore
 
 
@@ -80,19 +81,18 @@ def main(argv=None):
             return 1
     if args.command == "doctor":
         root = Path(args.root)
-        if not root.exists() or not (root / "realm.sqlite3").exists():
-            result = {"state": "uninitialized", "ok": True, "next_action": "banodoco-runtime start"}
-        else:
-            try:
-                store = RealmStore(root, acquire_owner=False)
-                result = store.doctor(catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None)
-                store.close()
-            except Exception as exc:
-                result = {"state": "unhealthy", "ok": False, "error": str(exc)}
+        result = RealmStore.inspect_realm(
+            root,
+            catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None,
+        )
+        if result.get("state") == "uninitialized":
+            result["next_action"] = "banodoco-runtime start"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
     if args.command == "backup":
-        store = RealmStore(args.root, acquire_owner=False)
+        # Online backup goes through the owning HTTP service. The CLI is an
+        # offline surface and must acquire that same realm-owner fence.
+        store = RealmStore(args.root)
         try:
             result = create_backup(store, args.destination)
         finally:
@@ -104,7 +104,9 @@ def main(argv=None):
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "export":
-        store = RealmStore(args.root, acquire_owner=False)
+        # Export is an offline surface; share the same owner fence as startup
+        # instead of opening a second migration-capable connection.
+        store = RealmStore(args.root)
         try:
             value = structured_export(store)
         finally:
@@ -116,7 +118,9 @@ def main(argv=None):
         return 0
     if args.command == "purge":
         root = Path(args.root).expanduser().resolve()
-        store = RealmStore(root, acquire_owner=False)
+        # Refuse even a correctly confirmed purge while a daemon owns the
+        # realm.  The destructive operation remains explicit and offline.
+        store = RealmStore(root)
         try:
             realm_id = store.realm["id"]
             if args.confirm != f"PURGE {realm_id}":
@@ -135,7 +139,8 @@ def main(argv=None):
     except Exception as exc:
         # Installed operator entrypoints must fail as a stable JSON boundary;
         # never leak a traceback for a missing migration or bad root.
-        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
+        print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1
     print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES)}, sort_keys=True), flush=True)
     stop = False

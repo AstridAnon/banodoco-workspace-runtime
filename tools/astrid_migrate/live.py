@@ -43,7 +43,7 @@ LIVE_AUTHORIZATION_IDS = (
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
-def _database_snapshot_sha256(path: Path) -> str:
+def _database_snapshot_sha256(path: Path, *, connection: sqlite3.Connection, owner_lock: Any) -> str:
     """Hash a consistent SQLite snapshot, including committed WAL state.
 
     Hashing only the main database file is not sufficient while the runtime is
@@ -56,12 +56,11 @@ def _database_snapshot_sha256(path: Path) -> str:
     path = _absolute_path(path)
     parent_identity = _capture_parent(path)
     parent_fd = int(parent_identity.get("_parent_fd"))
-    source = None
+    source = connection
     temporary_name = None
     temporary_fd = -1
     cwd_fd = -1
     try:
-        source = sqlite3.connect(str(path), timeout=10)
         temporary_name, temporary_fd = _mkdir_temp_at(parent_fd, ".b12-db-snapshot-")
         cwd_fd = os.open(".", _DIR_FLAGS)
         try:
@@ -71,8 +70,9 @@ def _database_snapshot_sha256(path: Path) -> str:
             os.fchdir(parent_fd)
             target = sqlite3.connect(str(Path(temporary_name) / "snapshot.sqlite3"), timeout=10)
             try:
-                source.backup(target)
-                target.commit()
+                with owner_lock:
+                    source.backup(target)
+                    target.commit()
             finally:
                 target.close()
         finally:
@@ -96,8 +96,6 @@ def _database_snapshot_sha256(path: Path) -> str:
                 os.fchdir(cwd_fd)
             finally:
                 os.close(cwd_fd)
-        if source is not None:
-            source.close()
         if temporary_fd >= 0:
             os.close(temporary_fd)
         if temporary_name is not None:
@@ -113,9 +111,13 @@ def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _database_semantic_sha256(path: Path) -> str:
+def _database_semantic_sha256(path: Path, *, immutable: bool = False) -> str:
     """Hash durable realm data while excluding the boot/session control row."""
-    connection = sqlite3.connect(str(path))
+    # Semantic verification is read-only. Opening a backup with a writable
+    # default connection can create `-wal`/`-shm` siblings after the backup
+    # has already passed its consolidated-file check.
+    query = "immutable=1" if immutable else "mode=ro"
+    connection = sqlite3.connect(f"file:{path}?{query}", uri=True)
     connection.row_factory = sqlite3.Row
     try:
         # Runtime startup refreshes capability metadata and SQLite sequence
@@ -445,7 +447,7 @@ class LiveMigration:
         current_epoch = int(self.active_runtime.health()["runtime_epoch"])
         same_session = identity.get("runtime_session_id") == getattr(self.active_runtime, "runtime_session_id", None)
         if same_session or current_epoch <= identity_epoch:
-            if identity.get("active_database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
+            if identity.get("active_database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn, owner_lock=self.active_runtime.store._mutex):
                 raise MigrationError("B12 terminal replay conflicts with the active final identity")
         elif identity.get("active_database_semantic_sha256") != _database_semantic_sha256(self.active_runtime.store.db_path):
             raise MigrationError("B12 terminal replay conflicts with the active durable database state")
@@ -641,17 +643,18 @@ class LiveMigration:
             raise MigrationError(f"B12 destination backup cannot be verified: {backup}") from exc
         if verified["manifest"].get("realm_id") != realm_id:
             raise MigrationError("B12 destination backup realm identity changed")
-        if _database_semantic_sha256(root / "realm.sqlite3") != _database_semantic_sha256(backup / "realm.sqlite3"):
+        if _database_semantic_sha256(root / "realm.sqlite3") != _database_semantic_sha256(backup / "realm.sqlite3", immutable=True):
             raise MigrationError("B12 destination changed after reconciliation")
         expected = {str(item["digest"]): str(item["sha256"]) for item in verified["cas_manifest"].get("objects", [])}
         if self._cas_content_map(root) != expected:
             raise MigrationError("B12 destination CAS changed after reconciliation")
-        store = type(self.active_runtime.store)(root, acquire_owner=False)
-        try:
-            if store.realm["id"] != realm_id or not store.doctor()["ok"]:
-                raise MigrationError("B12 destination failed its final doctor check")
-        finally:
-            store.close()
+        # The semantic comparison above already binds every durable row,
+        # including realm identity.  Inspect an isolated WAL-aware copy here;
+        # reopening the stopped destination through RealmStore would run
+        # migrations and create SQLite sidecars during verification.
+        report = type(self.active_runtime.store).inspect_realm(root)
+        if not report.get("ok"):
+            raise MigrationError("B12 destination failed its final doctor check")
 
     def _active_matches_candidate(self, candidate: Path, realm_id: str) -> bool:
         """Recognize an already-completed activation after process restart.
@@ -682,7 +685,7 @@ class LiveMigration:
             manifest = verified["manifest"]
             if manifest.get("realm_id") != realm_id or self.active_runtime.realm["id"] != realm_id or not self.active_runtime.doctor().get("ok"):
                 return False
-            if _database_semantic_sha256(self.active_runtime.store.db_path) != _database_semantic_sha256(backup / "realm.sqlite3"):
+            if _database_semantic_sha256(self.active_runtime.store.db_path) != _database_semantic_sha256(backup / "realm.sqlite3", immutable=True):
                 return False
             expected = {str(item["digest"]): str(item["sha256"]) for item in verified["cas_manifest"].get("objects", [])}
             return self._cas_content_map(_absolute_path(self.active_runtime.store.root)) == expected
@@ -1004,7 +1007,7 @@ class LiveMigration:
                 baseline_effect = self._existing_effect(journal, "active-baseline")
                 if not baseline_effect:
                     baseline_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
-                    baseline_payload = {"semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(baseline_snapshot)), "database_sha256": _database_snapshot_sha256(active.store.db_path), "realm_id": realm_id}
+                    baseline_payload = {"semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(baseline_snapshot)), "database_sha256": _database_snapshot_sha256(active.store.db_path, connection=active.store.conn, owner_lock=active.store._mutex), "realm_id": realm_id}
                     journal.effect("active-baseline", **baseline_payload)
                 self._consume_authorization("AUTH-LIVE-MIGRATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
 
@@ -1039,7 +1042,17 @@ class LiveMigration:
                     cwd_fd = os.open(".", _DIR_FLAGS)
                     try:
                         os.fchdir(destination_root_fd)
-                        destination = type(active)(Path("."), display_name=active.realm["display_name"], realm_id=realm_id)
+                        try:
+                            destination = type(active)(Path("."), display_name=active.realm["display_name"], realm_id=realm_id)
+                        except Exception as exc:
+                            # A resumed destination is an authenticated
+                            # migration artifact, not a fresh service. Let
+                            # reconciliation report that its durable state
+                            # changed instead of leaking a startup admission
+                            # failure through the B12 protocol. Any failure
+                            # at this seam means the retained destination is
+                            # no longer a valid migration artifact.
+                            raise MigrationError("B12 destination changed before reconciliation") from exc
                     finally:
                         os.fchdir(cwd_fd)
                         os.close(cwd_fd)
@@ -1256,7 +1269,7 @@ class LiveMigration:
                 if not active.doctor().get("ok"):
                     raise MigrationError("B12.4 final runtime failed integrity verification")
                 artifacts = self._runtime_artifact_identity(active, source_manifest_sha256=source_manifest_sha256)
-                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "runtime_session_id": active.runtime_session_id, "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _database_snapshot_sha256(active.store.db_path), "active_database_semantic_sha256": _database_semantic_sha256(active.store.db_path), "active_semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "active_cas_manifest_sha256": self._cas_manifest_digest(final_snapshot), "activation_manifest_sha256": artifacts["activation_manifest_sha256"], "catalog_identity": artifacts["catalog"], "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
+                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "runtime_session_id": active.runtime_session_id, "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _database_snapshot_sha256(active.store.db_path, connection=active.store.conn, owner_lock=active.store._mutex), "active_database_semantic_sha256": _database_semantic_sha256(active.store.db_path), "active_semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "active_cas_manifest_sha256": self._cas_manifest_digest(final_snapshot), "activation_manifest_sha256": artifacts["activation_manifest_sha256"], "catalog_identity": artifacts["catalog"], "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
                 _write_json(evidence_root / "activated-destination-b12-reactivated.json", {"packet": "B12.3", "state": "reactivated", **{key: identity[key] for key in ("realm_id", "source_manifest_sha256", "activation_epoch", "runtime_epoch", "active_database_sha256")}})
                 journal.effect("final-identity", identity=identity)
                 journal.effect("capacity-release", reservation_id=reservation.reservation_id, reason="terminal")

@@ -1,7 +1,7 @@
 {
   "protocol": "workspace.v1",
   "openapi": "openapi/workspace-v1.yaml",
-  "schemas": ["schemas/common.json", "schemas/health.json", "schemas/handshake.json", "schemas/handshake-response.json", "schemas/realm.json", "schemas/project.json", "schemas/run.json", "schemas/managed-object.json", "schemas/envelope.json", "schemas/task.json", "schemas/event.json", "schemas/worker.json", "schemas/timeline.json", "schemas/document.json", "schemas/timeline-revision.json", "schemas/timeline-diff.json", "schemas/media-relation.json", "schemas/generation.json", "schemas/doctor.json", "schemas/backup.json", "schemas/export.json", "schemas/realm-lifecycle.json", "schemas/shot-text-binding.json"],
+  "schemas": ["schemas/common.json", "schemas/health.json", "schemas/handshake.json", "schemas/handshake-response.json", "schemas/realm.json", "schemas/project.json", "schemas/run.json", "schemas/managed-object.json", "schemas/envelope.json", "schemas/task.json", "schemas/event.json", "schemas/worker.json", "schemas/timeline.json", "schemas/timeline-clip-replacement.json", "schemas/document.json", "schemas/timeline-revision.json", "schemas/timeline-diff.json", "schemas/media-relation.json", "schemas/generation.json", "schemas/doctor.json", "schemas/backup.json", "schemas/export.json", "schemas/realm-lifecycle.json", "schemas/shot-text-binding.json"],
   "generator": "generators/generate.py",
   "generated": {
     "python": "packages/python/banodoco_workspace_client/generated.py",

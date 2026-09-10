@@ -4,7 +4,10 @@ import hashlib
 import json
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from banodoco_workspace_client import ApiError, ClaimWaiting, WorkspaceClient
@@ -90,6 +93,58 @@ def test_api_error_preserves_conflict_and_version_details() -> None:
         assert exc.status == 409 and exc.code == "version_conflict" and exc.details["actual"] == 3
     else:
         raise AssertionError("expected ApiError")
+
+
+def test_client_correlates_transport_timeout_and_http_failure() -> None:
+    observed_request_ids = []
+
+    def timed_out(_method, _path, headers, _body):
+        observed_request_ids.append(headers["X-Request-ID"])
+        raise TimeoutError("late")
+
+    with pytest.raises(ApiError) as timeout_error:
+        WorkspaceClient("http://runtime", transport=timed_out, timeout=0.25).health()
+    assert timeout_error.value.code == "transport_timeout"
+    assert timeout_error.value.request_id == observed_request_ids[0]
+
+    def rejected(_method, _path, headers, _body):
+        observed_request_ids.append(headers["X-Request-ID"])
+        return 503, {}, json.dumps({"code": "registration_failed", "message": "terminal"}).encode()
+
+    with pytest.raises(ApiError) as rejected_error:
+        WorkspaceClient("http://runtime", transport=rejected).health()
+    assert rejected_error.value.code == "registration_failed"
+    assert rejected_error.value.request_id == observed_request_ids[1]
+
+
+def test_client_applies_bounded_timeout_to_stdlib_transport(monkeypatch) -> None:
+    observed = {}
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1}).encode()
+
+    def urlopen(request, *, timeout):
+        observed["timeout"] = timeout
+        observed["request_id"] = request.headers["X-request-id"]
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = WorkspaceClient("http://runtime", timeout=1.5)
+    assert client.health().status == "ok"
+    assert observed["timeout"] == 1.5
+    assert observed["request_id"].startswith("request-")
+    with pytest.raises(ValueError, match="finite and positive"):
+        WorkspaceClient("http://runtime", timeout=0)
 
 
 def test_claim_capability_unavailable_is_typed_waiting_result() -> None:

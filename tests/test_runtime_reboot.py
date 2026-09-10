@@ -41,8 +41,8 @@ def test_reboot_requeues_durable_task_and_fences_old_process(tmp_path):
         assert recovered["task"]["waiting_reason"] == "runtime_recovery"
         assert recovered["task"]["id"] == task_id
 
-        with pytest.raises(LeaseError):
-            second.settle_attempt(old_lease["attempt_id"], {"lease_id": old_lease["lease_id"], "fence": old_lease["fence"], "outputs": []}, idempotency_key="reboot-old-settle")
+        with pytest.raises(LeaseError, match="stale or already settled"):
+            second.settle_attempt(old_lease["attempt_id"], {"lease_id": old_lease["lease_id"], "fence": old_lease["fence"], "runtime_epoch": second.health()["runtime_epoch"], "outputs": []}, idempotency_key="reboot-old-settle")
 
         resumed = second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": second.health()["runtime_epoch"]})
         assert resumed["task_id"] == task_id
@@ -245,12 +245,13 @@ def test_stale_client_must_supply_runtime_epoch_after_reboot(tmp_path):
     first = RuntimeService(root)
     first.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
     first.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "epoch"})
-    first.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": first.health()["runtime_epoch"]})
+    old_epoch = first.health()["runtime_epoch"]
+    first.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": old_epoch})
     first.close()
     second = RuntimeService(root)
     try:
-        with pytest.raises(LeaseError):
-            second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"]})
+        with pytest.raises(LeaseError, match="stale runtime epoch"):
+            second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": old_epoch})
         claimed = second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": second.health()["runtime_epoch"]})
         assert claimed["runtime_epoch"] == second.health()["runtime_epoch"]
     finally:

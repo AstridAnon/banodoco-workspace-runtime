@@ -885,6 +885,37 @@ def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catal
     atomic_write_json(paths.discovery_path, dict(discovery))
 
 
+def _commit_source_profile_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any]) -> None:
+    """Persist an explicitly selected source profile without rewriting discovery."""
+    catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
+    source_path = paths.source_profiles_dir / f"{source.profile}.json"
+    source_before = source_path.read_bytes() if source_path.is_file() and not source_path.is_symlink() else None
+    if catalog_before is not None and source_before is not None:
+        try:
+            if json.loads(catalog_before) == dict(catalog) and json.loads(source_before) == source.as_dict():
+                return
+        except (ValueError, UnicodeDecodeError):
+            pass
+    try:
+        atomic_write_json(paths.catalog_path, dict(catalog))
+        atomic_write_json(source_path, source.as_dict())
+    except Exception:
+        try:
+            if catalog_before is None:
+                remove_file(paths.catalog_path)
+            else:
+                paths.catalog_path.write_bytes(catalog_before)
+                owner_only(paths.catalog_path)
+            if source_before is None:
+                remove_file(source_path)
+            else:
+                source_path.write_bytes(source_before)
+                owner_only(source_path)
+        except OSError:
+            pass
+        raise
+
+
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
@@ -934,6 +965,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             connection = boundary.connect(endpoint=endpoint, credential=token)
             realm_id = str(discovery["active_realm"])
             _provision_connection(connection, actor_id, token, realm_id)
+            realm["source_profile"] = source.profile
+            catalog["source_profiles"][source.profile] = source.as_dict()
+            _commit_source_profile_metadata(paths, source, catalog)
             diagnostics.append("runtime checkout differences are provenance only")
             worker = _worker_handoff(discovery)
             return BootstrapResult(

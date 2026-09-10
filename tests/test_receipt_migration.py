@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from runtime_protocol.service import RuntimeService
-from runtime_protocol.errors import ValidationError
+from runtime_protocol.errors import RealmAdmissionError
 
 
 def _digest(capability: str) -> str:
@@ -120,8 +120,9 @@ def test_receipt_backfill_failure_rolls_back_and_can_retry(tmp_path):
     )
     conn.commit()
     conn.close()
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(RealmAdmissionError) as failure:
         RuntimeService(root)
+    assert failure.value.details["checks"]["sqlite_integrity"]["reason"] == "malformed"
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
     assert conn.execute("SELECT COUNT(*) FROM command_idempotency WHERE txn_id IS NOT NULL").fetchone()[0] == 0
@@ -140,14 +141,16 @@ def test_receipt_backfill_failure_rolls_back_and_can_retry(tmp_path):
 def test_schema15_task_event_ambiguity_fails_closed_without_partial_backfill(tmp_path, event_mode):
     root = tmp_path / event_mode
     _make_schema15(root, event_mode)
-    with pytest.raises(ValidationError, match="exactly one"):
+    with pytest.raises(RealmAdmissionError) as failure:
         RuntimeService(root)
+    assert "exactly one" in failure.value.details["checks"]["sqlite_integrity"]["result"]
     conn = sqlite3.connect(root / "realm.sqlite3")
-    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 15
     assert conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_receipt_backfills'"
     ).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM command_idempotency WHERE txn_id IS NOT NULL").fetchone()[0] == 0
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(command_idempotency)")}
+    assert "txn_id" not in columns
     expected_events = 0 if event_mode == "missing" else 2
     assert conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.admitted'").fetchone()[0] == expected_events
     conn.close()

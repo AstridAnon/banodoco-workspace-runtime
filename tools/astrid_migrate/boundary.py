@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import shutil
 import stat
 import time
 from datetime import datetime, timezone
@@ -340,12 +339,25 @@ def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
             raise ConflictError(f"backup SQLite entry is not an ordinary file: {name}")
         duplicate = os.dup(fd)
         try:
-            return sqlite3.connect(f"file:/dev/fd/{duplicate}?immutable=1", uri=True)
+            connection = sqlite3.connect(f"file:/dev/fd/{duplicate}?immutable=1", uri=True)
+            os.close(duplicate)
+            return connection
         except Exception:
             os.close(duplicate)
             raise
     finally:
         os.close(fd)
+
+
+def _reject_sqlite_sidecars(root_fd: int, *, label: str) -> None:
+    """Backups/candidates contain one consolidated SQLite database."""
+    for suffix in ("-wal", "-shm", "-journal"):
+        name = "realm.sqlite3" + suffix
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ConflictError(f"{label} contains an unmanifested SQLite sidecar", details={"file": name})
 
 
 def _key_id(key: bytes) -> str:
@@ -436,6 +448,7 @@ def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path:
         validate_parent(root, identity, allow_parent_appeared=bool(identity.get("parent_was_missing")))
         parent = Path(str(identity["parent"]))
         backup_fd = _open_relative(int(identity["_parent_fd"]), root.relative_to(parent), directory=True)
+        _reject_sqlite_sidecars(backup_fd, label="backup")
         manifest = _json_at(backup_fd, "manifest.json")
         if manifest.get("format_version") != 2:
             raise ConflictError("legacy or unsupported backup format")
@@ -500,6 +513,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
         candidate_fd = _open_relative(int(identity["_parent_fd"]), root.relative_to(parent), directory=True)
         if not stat.S_ISDIR(os.fstat(candidate_fd).st_mode):
             raise ConflictError("restore candidate is not an ordinary directory")
+        _reject_sqlite_sidecars(candidate_fd, label="restore candidate")
         handoff = _json_at(candidate_fd, "activation-handoff.json")
         candidate_hash, _ = _sha256_at(candidate_fd, "realm.sqlite3")
         source = absolute_path(str(handoff.get("source_backup", "")))
@@ -575,21 +589,6 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
             close_pinned(source_identity)
         if own_identity:
             close_pinned(identity)
-
-
-def restore_backup(backup_dir: str | Path, destination: str | Path, **kwargs):
-    source = absolute_path(backup_dir); target = absolute_path(destination)
-    verified = verify_backup(source, key=kwargs.get("key"))
-    target.mkdir(mode=0o700, parents=True, exist_ok=False)
-    shutil.copy2(source / "realm.sqlite3", target / "realm.sqlite3")
-    shutil.copytree(source / "cas", target / "cas", symlinks=False)
-    manifest = verified["manifest"]; key = kwargs.get("key") or _key(manifest)
-    handoff = {"format_version": 2, "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "realm_id": manifest.get("realm_id"), "candidate_database_sha256": _sha256(target / "realm.sqlite3")}
-    payload = dict(handoff)
-    handoff["handoff_sha256"] = hashlib.sha256(canonical_json(payload).encode()).hexdigest()
-    handoff["handoff_hmac"] = hmac.new(key, canonical_json(payload).encode(), hashlib.sha256).hexdigest()
-    (target / "activation-handoff.json").write_text(canonical_json(handoff) + "\n")
-    return verify_restore_candidate(target)
 
 
 def _open_relative(root_fd: int, relative: str | Path, *, directory: bool = False) -> int:

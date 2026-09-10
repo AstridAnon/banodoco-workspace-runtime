@@ -28,6 +28,12 @@ class OwnerBusyError(ConflictError):
     code = "owner_busy"
 
 
+class RealmAdmissionError(ConflictError):
+    """An existing realm failed the bounded, read-only startup gate."""
+
+    code = "realm_admission_failed"
+
+
 class LeaseError(ConflictError):
     code = "lease_fenced"
 

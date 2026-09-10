@@ -92,6 +92,7 @@
         "outputs": [
           {
             "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "duration_seconds": 1.25,
             "kind": "object",
             "media_type": "video/mp4",
             "name": "render",

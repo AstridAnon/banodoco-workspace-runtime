@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from runtime_protocol.store import RealmStore
+from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 
 
 def _make_schema18_realm(root: Path) -> None:
@@ -33,7 +33,7 @@ def test_schema18_worker_state_migrates_to_one_executor_authority(tmp_path):
     _make_schema18_realm(root)
     store = RealmStore(root)
     try:
-        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
         assert store.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
         executor = store.conn.execute("SELECT * FROM executors WHERE id='legacy-executor'").fetchone()
         assert executor["max_concurrency"] == 2
@@ -64,7 +64,7 @@ def test_schema19_authority_migration_is_safe_to_retry_after_structural_upgrade(
 
     retried = RealmStore(root)
     try:
-        assert retried.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert retried.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
         assert retried.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
         assert "readiness" in {row[1] for row in retried.conn.execute("PRAGMA table_info(executors)")}
         assert "executor_id" in {row[1] for row in retried.conn.execute("PRAGMA table_info(tasks)")}
@@ -90,7 +90,7 @@ def test_schema21_executor_identity_migration_preserves_rows_without_history(tmp
 
     store = RealmStore(root)
     try:
-        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 21
+        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
         row = store.conn.execute("SELECT * FROM executors WHERE id='legacy-executor'").fetchone()
         assert (row["max_concurrency"], row["resource_keys_json"], row["capabilities_json"], row["readiness"], row["readiness_reason"], row["last_seen_at"]) == (2, '["gpu"]', '["render.basic"]', "not_ready", "warming", "2026-01-02")
         assert (row["source_digest"], row["dependency_digest"], row["source_epoch"]) == (None, None, None)
