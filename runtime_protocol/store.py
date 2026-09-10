@@ -1511,6 +1511,7 @@ class RealmStore:
             if changed.rowcount != 1:
                 raise ConflictError("stale settlement effect target generation version")
             metadata = {
+                "source_task_id": str(task_id),
                 "source_variant_id": payload["source_variant_id"],
                 "source_object_id": payload["source_object_id"],
                 "output_name": payload["output_name"],
