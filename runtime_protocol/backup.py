@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 import stat
 from typing import Any, Mapping
@@ -314,12 +315,62 @@ def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
             raise ConflictError(f"backup SQLite entry is not a regular file: {name}")
         sqlite_fd = os.dup(fd)
         try:
-            return sqlite3.connect(f"file:/dev/fd/{sqlite_fd}?immutable=1", uri=True)
+            connection = sqlite3.connect(f"file:/dev/fd/{sqlite_fd}?immutable=1", uri=True)
+            os.close(sqlite_fd)
+            return connection
         except Exception:
             os.close(sqlite_fd)
             raise
     finally:
         os.close(fd)
+
+
+def _reject_sqlite_sidecars(root_fd: int, *, label: str) -> None:
+    """Enforce the consolidated backup/candidate database contract.
+
+    Live realms may legitimately carry WAL state and startup admission keeps
+    it. Backups and their restore candidates are different: the online backup
+    API has already folded committed state into one authenticated database.
+    Accepting an unmanifested sidecar here would make later activation observe
+    bytes that verification deliberately ignored.
+    """
+    for suffix in ("-wal", "-shm", "-journal"):
+        name = "realm.sqlite3" + suffix
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ConflictError(f"{label} contains an unmanifested SQLite sidecar", details={"file": name})
+
+
+def _inspect_consolidated_realm(root_fd: int) -> tuple[dict, dict]:
+    """Run the full RealmStore doctor logic over an immutable descriptor DB."""
+    from .store import RealmStore
+
+    connection = _connection_from_fd(root_fd, "realm.sqlite3")
+    connection.row_factory = sqlite3.Row
+    inspector = object.__new__(RealmStore)
+    # Keep CAS reads rooted at the retained directory descriptor. This is a
+    # read-only /dev/fd alias; no candidate pathname is reopened.
+    inspector.root = Path(f"/dev/fd/{root_fd}")
+    inspector.db_path = inspector.root / "realm.sqlite3"
+    inspector.cas_root = inspector.root / "cas" / "sha256"
+    try:
+        inspector._cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
+    except FileNotFoundError:
+        inspector._cas_root_fd = -1
+    inspector.conn = connection
+    inspector._mutex = threading.RLock()
+    try:
+        report = inspector.integrity_report()
+        if not report.get("ok"):
+            raise ConflictError("realm failed integrity checks", details=report)
+        realm = inspector.realm
+        return report, realm
+    finally:
+        connection.close()
+        if inspector._cas_root_fd >= 0:
+            os.close(inspector._cas_root_fd)
 
 
 def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None) -> dict:
@@ -344,6 +395,7 @@ def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, k
             parent_path = Path(str(directory_identity["parent"]))
             relative = root.relative_to(parent_path)
             backup_fd = _open_relative(parent_fd, relative, directory=True)
+            _reject_sqlite_sidecars(backup_fd, label="backup")
             manifest = _json_at(backup_fd, "manifest.json")
         except FileNotFoundError as exc:
             raise NotFoundError("backup is incomplete", details={"backup": str(root)}) from exc
@@ -385,19 +437,11 @@ def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, k
         if manifest.get("cas_manifest_sha256") != cas.get("manifest_sha256"):
             raise ConflictError("backup CAS manifest hash mismatch")
         _verify_cas_manifest(backup_fd, cas)
-        connection = _connection_from_fd(backup_fd, "realm.sqlite3")
-        try:
-            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise ConflictError("backup SQLite quick check failed")
-            if connection.execute("PRAGMA foreign_key_check").fetchall():
-                raise ConflictError("backup SQLite foreign-key check failed")
-            realm = connection.execute("SELECT id, display_name FROM realm LIMIT 1").fetchone()
-            if not realm or realm[0] != manifest.get("realm_id"):
-                raise ConflictError("backup realm identity mismatch")
-        finally:
-            connection.close()
+        report, realm = _inspect_consolidated_realm(backup_fd)
+        if not realm or realm["id"] != manifest.get("realm_id"):
+            raise ConflictError("backup realm identity mismatch")
         validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
-        return {"manifest": manifest, "cas_manifest": cas}
+        return {"manifest": manifest, "cas_manifest": cas, "doctor": report}
     finally:
         if backup_fd >= 0:
             os.close(backup_fd)
@@ -416,8 +460,6 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
     candidate_fd = -1
     source_fd = -1
     source_identity = None
-    cwd_fd = -1
-    restored = None
     try:
         validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
         parent_fd = int(directory_identity.get("_parent_fd"))
@@ -429,6 +471,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
             candidate_fd = os.open(str(relative), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
         if not stat.S_ISDIR(os.fstat(candidate_fd).st_mode):
             raise ConflictError("restore candidate is not an ordinary directory")
+        _reject_sqlite_sidecars(candidate_fd, label="restore candidate")
         try:
             handoff = _json_at(candidate_fd, "activation-handoff.json")
             candidate_db_hash, _ = _sha256_at(candidate_fd, "realm.sqlite3")
@@ -490,28 +533,12 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
         finally:
             os.close(sha_fd)
             os.close(cas_fd)
-        from .store import RealmStore
-        # RealmStore performs startup durability operations even for doctor.
-        # Make its relative root resolve from the retained candidate inode.
-        cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        os.fchdir(candidate_fd)
-        restored = RealmStore(Path("."), acquire_owner=False)
-        report = restored.doctor()
-        if not report["ok"]:
-            raise ConflictError("restore candidate failed integrity checks", details=report)
-        realm = restored.realm
-        if realm["id"] != source_manifest.get("realm_id"):
+        report, realm = _inspect_consolidated_realm(candidate_fd)
+        if not realm or realm["id"] != source_manifest.get("realm_id"):
             raise ConflictError("restore candidate realm identity mismatch")
         validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
         return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
     finally:
-        if restored is not None:
-            restored.close()
-        if cwd_fd >= 0:
-            try:
-                os.fchdir(cwd_fd)
-            finally:
-                os.close(cwd_fd)
         if candidate_fd >= 0:
             os.close(candidate_fd)
         if source_fd >= 0:
@@ -523,6 +550,8 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
 
 
 def create_backup(store, destination: str | Path, *, binding: dict | None = None, key: bytes | None = None, key_path: str | Path | None = None, destination_identity: Mapping[str, Any] | None = None) -> dict:
+    if getattr(store, "_lock_file", None) is None:
+        raise ConflictError("backup requires the owning realm connection")
     destination = absolute_path(destination)
     if os.path.lexists(str(destination)):
         raise ConflictError("backup destination already exists", details={"destination": str(destination)})
@@ -556,6 +585,15 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 target.commit()
             finally:
                 target.close()
+            # A backup target may inherit WAL mode from the live connection.
+            # The authenticated backup format contains one consolidated
+            # database, so remove SQLite's target-only sidecars before the
+            # directory is manifested and published.
+            for suffix in ("-wal", "-shm", "-journal"):
+                try:
+                    os.unlink(f"realm.sqlite3{suffix}", dir_fd=temporary_fd)
+                except FileNotFoundError:
+                    pass
             for obj in cas["objects"]:
                 obj_dir = mkdir_chain_at(temporary_fd, f"cas/sha256/{obj['digest'][:2]}")
                 try:
@@ -678,24 +716,9 @@ def restore_backup(
         temporary_name, temporary_fd = mkdir_temp_at(parent_fd, f".{destination.name}.")
         copy_file_at(source_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
         copy_tree_at(source_fd, "cas", temporary_fd, "cas")
-        from .store import RealmStore
-        # RealmStore performs startup migrations/control writes. Keep cwd on
-        # the pinned destination parent while opening its relative temporary
-        # root so a parent swap cannot redirect those writes.
-        cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fchdir(parent_fd)
-            restored = RealmStore(Path(temporary_name), acquire_owner=False)
-        finally:
-            os.fchdir(cwd_fd)
-            os.close(cwd_fd)
-        try:
-            report = restored.doctor()
-            if not report["ok"]:
-                raise ConflictError("restored realm failed integrity checks", details=report)
-            realm = restored.realm
-        finally:
-            restored.close()
+        report, realm = _inspect_consolidated_realm(temporary_fd)
+        if not realm or realm["id"] != verified["manifest"].get("realm_id"):
+            raise ConflictError("restored realm identity mismatch", details=report)
         source_manifest_sha256, _ = _sha256_at(source_fd, "manifest.json")
         handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": source_manifest_sha256, "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _file_record_at(temporary_fd, "realm.sqlite3")["sha256"], "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
         handoff["handoff_sha256"] = _authenticated_digest(handoff)

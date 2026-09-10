@@ -127,12 +127,23 @@ class BootstrapTests(unittest.TestCase):
 
     def test_second_launch_reconnects_same_owner_and_actor(self):
         first = bootstrap(self.paths, self.boundary, self.config)
-        second = bootstrap(self.paths, self.boundary, self.config)
+        discovery_before = self.paths.discovery_path.read_bytes()
+        updated = SourceProfile(
+            profile="astrid",
+            runtime_checkout="/checkouts/runtime-pinned",
+            source_checkout="/checkouts/astrid-pinned",
+            capability_digest="caps-v1",
+        )
+        second = bootstrap(self.paths, self.boundary, BootstrapConfig(source_profile=updated))
         self.assertEqual(second.status, "reconnected")
         self.assertEqual(first.realm_id, second.realm_id)
         self.assertEqual(first.actor_id, second.actor_id)
         self.assertEqual(len(self.boundary.starts), 1)
         self.assertEqual(len(self.boundary.connects), 2)
+        self.assertEqual(self.paths.discovery_path.read_bytes(), discovery_before)
+        self.assertEqual(json.loads((self.paths.source_profiles_dir / "astrid.json").read_text()), updated.as_dict())
+        catalog = json.loads(self.paths.catalog_path.read_text())
+        self.assertEqual(catalog["source_profiles"]["astrid"], updated.as_dict())
 
     def test_stale_discovery_restarts_without_second_realm(self):
         first = bootstrap(self.paths, self.boundary, self.config)

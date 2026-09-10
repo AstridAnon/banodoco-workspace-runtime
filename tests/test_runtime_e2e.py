@@ -6,6 +6,8 @@ import os
 import threading
 import urllib.error
 import subprocess
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -61,6 +63,33 @@ def test_project_managed_object_and_fake_executor_end_to_end(daemon):
     assert settled.state == "succeeded"
     events = client.events(task["run_id"])
     assert [event["event_type"] for event in events["items"]] == ["task.admitted", "task.claimed", "task.completed"]
+
+
+def test_threaded_http_dispatch_serializes_shared_runtime(daemon, monkeypatch):
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+
+    def slow_health():
+        nonlocal active, maximum
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.03)
+        with guard:
+            active -= 1
+        return {"status": "ok"}
+
+    monkeypatch.setattr(daemon.service, "health", slow_health)
+
+    def request_health():
+        with urllib.request.urlopen(f"{daemon.endpoint}/v1/health", timeout=2) as response:
+            assert response.status == 200
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: request_health(), range(4)))
+
+    assert maximum == 1
 
 
 def test_timeline_create_replays_receipt_and_conflicts_on_changed_request(daemon, tmp_path):

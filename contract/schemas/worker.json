@@ -122,7 +122,8 @@
         "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "media_type": { "type": "string", "minLength": 1 },
         "size": { "type": "integer", "minimum": 0 },
-        "data_base64": { "type": "string" }
+        "data_base64": { "type": "string" },
+         "duration_seconds": { "type": "number", "exclusiveMinimum": 0 }
       }
     },
     "Effect": {

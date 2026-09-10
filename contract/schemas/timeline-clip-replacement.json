@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/timeline-clip-replacement.json",
+  "title": "Replace one canonical timeline clip",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["clip_id", "source_object_id", "expected_version"],
+  "properties": {
+    "clip_id": { "type": "string", "minLength": 1 },
+    "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "expected_version": { "type": "integer", "minimum": 1 },
+    "timing": { "type": "string", "const": "preserve-duration", "default": "preserve-duration" }
+  }
+}

@@ -179,6 +179,13 @@ paths:
       operationId: listTimelineHistory
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Timeline revisions, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineRevisionPage' } } } } }
+  /v1/timelines/{timeline_id}/replace-clip:
+    post:
+      operationId: replaceTimelineClip
+      description: Atomically replace one explicit composition clip with a managed object owned by the timeline project while preserving authored timing and unrelated document state.
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/timeline-clip-replacement.json' } } } }
+      responses: { '200': { description: Updated canonical timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/diff:
     get:
       operationId: diffTimeline
@@ -541,6 +548,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpoint' } } } }
       responses: { '201': { description: Durable checkpoint, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpointReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/publish-timeline-render:
+    post:
+      operationId: publishTimelineRender
+      description: Fenced, replay-safe publication of one canonical timeline revision and the render task bound to it.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, required: [lease_id, fence, runtime_epoch, timeline_id, expected_version, config, registry, render], properties: { lease_id: { type: string }, fence: { type: integer }, runtime_epoch: { type: integer, minimum: 1 }, timeline_id: { type: string }, expected_version: { type: integer, minimum: 1 }, config: { type: object }, registry: { type: object }, render: { type: object }, slug: { type: string }, name: { type: string } } } } } }
+      responses: { '200': { description: Durable timeline/render publication link, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/fail:
     post:
       operationId: failAttempt

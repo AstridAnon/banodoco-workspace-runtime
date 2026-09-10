@@ -80,3 +80,37 @@ def test_settlement_persists_flat_result_and_rejects_reserved_outputs(tmp_path):
         assert service.settle_attempt(attempt["attempt_id"], {**base, "result": {"answer": 42}}, idempotency_key="flat-result") == settled
     finally:
         service.close()
+
+
+def test_settlement_preserves_output_descriptors(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        task, attempt = _attempt(service)
+        payload = b"descriptor-output"
+        output = {
+            "name": "primary",
+            "kind": "object",
+            "digest": _digest(payload),
+            "media_type": "application/octet-stream",
+            "size": len(payload),
+            "data_base64": base64.b64encode(payload).decode("ascii"),
+            "ordinal": 0,
+            "role": "primary_render",
+            "is_primary": True,
+        }
+        settled = service.settle_attempt(
+            attempt["attempt_id"],
+            {
+                "lease_id": attempt["lease_id"],
+                "fence": attempt["fence"],
+                "runtime_epoch": attempt["runtime_epoch"],
+                "outputs": [output],
+                "result": {"answer": 7},
+            },
+            idempotency_key="descriptor-settle",
+        )
+        expected = {key: output[key] for key in ("name", "kind", "digest", "media_type", "size", "ordinal", "role", "is_primary")}
+        assert settled["data"]["result"]["outputs"] == [expected]
+        assert service.task(task["task"]["id"])["task"]["result"]["outputs"] == [expected]
+    finally:
+        service.close()

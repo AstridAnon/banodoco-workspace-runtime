@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
@@ -23,9 +25,19 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
 class RuntimeHandler(BaseHTTPRequestHandler):
     server_version = "BanodocoRuntime/0.1"
     MAX_BODY_BYTES = 64 * 1024 * 1024
+    REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 
     def log_message(self, *_):
         return
+
+    def _request_id(self):
+        current = getattr(self, "_runtime_request_id", None)
+        if current:
+            return current
+        supplied = self.headers.get("X-Request-ID", "")
+        value = supplied if self.REQUEST_ID_RE.fullmatch(supplied) else uuid.uuid4().hex
+        self._runtime_request_id = value
+        return value
 
     @property
     def runtime(self):
@@ -82,6 +94,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         self.send_response(status)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", self._request_id())
         for key, value in (headers or {}).items():
             self.send_header(key, str(value))
         if body is None:
@@ -96,9 +109,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
 
     def _error(self, exc):
         if isinstance(exc, RuntimeErrorBase):
-            self._send(exc.status, error=exc.as_dict())
+            payload = exc.as_dict()
+            payload["request_id"] = self._request_id()
+            self._send(exc.status, error=payload)
         else:
-            self._send(500, error={"code": "internal_error", "message": "internal runtime error"})
+            self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": self._request_id()})
 
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
@@ -198,6 +213,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
             self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] == "replace-clip" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.replace_timeline_clip(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("history", "diff") and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
@@ -465,6 +483,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 body["attempt_id"] = path[2]
                 return self._send(200, self.runtime.prepare_reboot(body, identity=identity))
             if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body(), identity=identity))
+            if action == "publish-timeline-render":
+                key = self._idempotency_key()
+                return self._send(200, self.runtime.publish_timeline_render(path[2], self._body(), idempotency_key=key, identity=identity))
             if action == "settle":
                 key = self._idempotency_key()
                 value = self.runtime.settle_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
@@ -532,35 +553,35 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.run(path[2]))
         raise NotFoundError("route not found")
 
-    def do_GET(self):
+    def _dispatch(self):
+        """Serialize handlers that share the daemon's SQLite connection.
+
+        ``ThreadingHTTPServer`` creates one handler thread per request, while
+        this runtime intentionally owns one SQLite connection.  The service
+        has finer-grained locks around many mutations, but read paths and
+        multi-step handlers also touch the connection; the HTTP boundary must
+        therefore serialize the complete route.
+        """
         try:
-            self._route()
+            with self.runtime.store._mutex:
+                self._route()
         except Exception as exc:
             self._error(exc)
+
+    def do_GET(self):
+        self._dispatch()
 
     def do_HEAD(self):
-        try:
-            self._route()
-        except Exception as exc:
-            self._error(exc)
+        self._dispatch()
 
     def do_POST(self):
-        try:
-            self._route()
-        except Exception as exc:
-            self._error(exc)
+        self._dispatch()
 
     def do_PATCH(self):
-        try:
-            self._route()
-        except Exception as exc:
-            self._error(exc)
+        self._dispatch()
 
     def do_PUT(self):
         self.do_PATCH()
 
     def do_DELETE(self):
-        try:
-            self._route()
-        except Exception as exc:
-            self._error(exc)
+        self._dispatch()

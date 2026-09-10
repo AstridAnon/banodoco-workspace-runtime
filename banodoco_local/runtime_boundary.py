@@ -107,6 +107,11 @@ class RuntimeConnection:
 class LocalRuntimeBoundary:
     """Launch and supervise a loopback daemon from an editable source profile."""
 
+    # Health is a loopback request, but the daemon may be briefly busy while
+    # finishing startup or serving another control-plane request.  Keep this
+    # bounded without making a normal, healthy runtime look stale.
+    HEALTH_TIMEOUT_SECONDS = 5.0
+
     def __init__(self, *, wait_seconds: float = WAIT_SECONDS):
         self.wait_seconds = wait_seconds
         self._process: subprocess.Popen[str] | None = None
@@ -234,7 +239,10 @@ class LocalRuntimeBoundary:
             # Do not derive imports from either checkout.  The selected
             # runtime_environment is an installed environment and the child
             # inherits the host's already-configured environment unchanged.
-            self._process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
+            # Preserve the daemon's structured startup failure on the existing
+            # operator log boundary; successful stdout is only its one-line
+            # launch record.
+            self._process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         except Exception:
             log.close()
             token_file.unlink(missing_ok=True)
@@ -243,8 +251,14 @@ class LocalRuntimeBoundary:
             log.close()
         self._source, self._realm_root, self._support_root, self._realm_id = source_profile, realm_root, support_root, realm_id
         self._bootstrap_credential = bootstrap_token
-        endpoint = self._wait_endpoint(support_root, self._process)
-        discovery = self._read_discovery(support_root)
+        try:
+            endpoint = self._wait_endpoint(support_root, self._process)
+            discovery = self._read_discovery(support_root)
+        except Exception:
+            self._terminate(self._process)
+            token_file.unlink(missing_ok=True)
+            self._bootstrap_credential = None
+            raise
         return {
             "endpoint": endpoint,
             "pid": self._process.pid,
@@ -320,23 +334,31 @@ class LocalRuntimeBoundary:
         raise BootstrapError("Runtime daemon did not become healthy before the bounded startup deadline.")
 
     @staticmethod
-    def _http_health(endpoint: str) -> bool:
+    def _http_status(endpoint: str) -> str | None:
         try:
             parsed = urlsplit(str(endpoint))
             if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
                     or parsed.username or parsed.password or parsed.query or parsed.fragment
                     or parsed.path not in ("", "/")
                     or parsed.port is None or not (1 <= parsed.port <= 65535)):
-                return False
+                return None
         except ValueError:
-            return False
+            return None
         request = urllib.request.Request(str(endpoint).rstrip("/") + "/v1/health", headers={"Accept": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=0.5) as response:
+            with urllib.request.urlopen(request, timeout=LocalRuntimeBoundary.HEALTH_TIMEOUT_SECONDS) as response:
                 value = json.loads(response.read().decode("utf-8"))
-            return value.get("status") == "ok" and value.get("protocol") == WIRE_PROTOCOL
+            if isinstance(value, dict) and value.get("protocol") == WIRE_PROTOCOL:
+                status = value.get("status")
+                if status in ("ok", "degraded"):
+                    return status
+            return None
         except (OSError, ValueError, json.JSONDecodeError):
-            return False
+            return None
+
+    @staticmethod
+    def _http_health(endpoint: str) -> bool:
+        return LocalRuntimeBoundary._http_status(endpoint) == "ok"
 
     def connect(self, *, endpoint: str, credential: str) -> RuntimeConnection:
         try:
@@ -386,7 +408,9 @@ class LocalRuntimeBoundary:
         expected_birth = process_birth_id or marker.get("process_birth_id")
         if not expected_birth or expected_birth != self.process_birth_identity(pid):
             return False
-        return self._http_health(endpoint)
+        # A degraded runtime can still be the correct owner. Keep health
+        # admission separate so database failures are not called PID conflicts.
+        return self._http_status(endpoint) is not None
 
     @staticmethod
     def is_pid_alive(pid: int) -> bool:

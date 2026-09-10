@@ -102,19 +102,28 @@ def test_reboot_executor_typeerror_is_not_retried(tmp_path):
 def test_recovery_epoch_is_required_before_mutation(tmp_path):
     service, attempt, epoch = _setup(tmp_path)
     try:
-        with pytest.raises(LeaseError, match="runtime epoch is required"):
+        with pytest.raises(ValidationError, match="request body is missing required fields"):
             service.prepare_reboot({"attempt_id": attempt["attempt_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"]})
-        with pytest.raises(LeaseError, match="runtime epoch is required"):
+        with pytest.raises(ValidationError, match="request body is missing required fields"):
             service.heartbeat_attempt(
                 attempt["attempt_id"],
                 {"lease_id": attempt["lease_id"], "fence": attempt["fence"]},
                 idempotency_key="b63-missing-epoch-heartbeat",
             )
-        with pytest.raises(LeaseError, match="runtime epoch is required"):
+        stale_epoch = epoch + 1
+        with pytest.raises(LeaseError, match="stale runtime epoch"):
             service.settle_attempt(
                 attempt["attempt_id"],
-                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "outputs": []},
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": stale_epoch, "outputs": []},
                 idempotency_key="b63-missing-epoch-settle",
+            )
+        with pytest.raises(LeaseError, match="stale runtime epoch"):
+            service.prepare_reboot({"attempt_id": attempt["attempt_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": stale_epoch})
+        with pytest.raises(LeaseError, match="stale runtime epoch"):
+            service.heartbeat_attempt(
+                attempt["attempt_id"],
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": stale_epoch},
+                idempotency_key="b63-stale-epoch-heartbeat",
             )
         assert service.store.conn.execute("SELECT recovery_nonce FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] is None
     finally:
