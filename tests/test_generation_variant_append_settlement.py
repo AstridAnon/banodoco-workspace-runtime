@@ -5,7 +5,7 @@ import hashlib
 
 import pytest
 
-from runtime_protocol.errors import ConflictError, ValidationError
+from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
 
 
@@ -136,6 +136,240 @@ def _settle(service: RuntimeService, attempt: dict, outputs: list[dict], *, key:
         },
         idempotency_key=key,
     )
+
+
+def _new_generation_setup(
+    service: RuntimeService,
+    *,
+    slug: str = "character",
+    effect_override: dict | None = None,
+    metadata_override: dict | None = None,
+) -> dict:
+    capability_digest = _digest(CAPABILITY)
+    executor_id = f"worker-{slug}"
+    service.register_executor(
+        {"executor_id": executor_id, "capabilities": [CAPABILITY]},
+        idempotency_key=f"executor-{slug}",
+    )
+    project = service.create_project(
+        {"slug": slug, "name": slug.title()}, idempotency_key=f"project-{slug}"
+    )
+    image = service.ingest(project["id"], b"character-image", idempotency_key=f"image-{slug}")
+    motion = service.ingest(project["id"], b"motion-video", idempotency_key=f"motion-{slug}")
+    input_object_ids = [image["data"]["digest"], motion["data"]["digest"]]
+    effect = {
+        "effect_type": "generation.create_with_variant",
+        "target_id": project["id"],
+        "payload": {
+            "generation_type": "video",
+            "metadata": metadata_override or {
+                "params": {
+                    "tool_type": "character_animate",
+                    "content_type": "video",
+                    "prompt": "walk forward",
+                },
+            },
+            "variant_type": "character_animation",
+            "output_name": "animated_video",
+            "output_ordinal": 0,
+            "primary_policy": "preserve",
+        },
+    }
+    admitted_effect = effect_override or effect
+    task = service.create_task(
+        {
+            "capability_id": CAPABILITY,
+            "capability_digest": capability_digest,
+            "project": project["id"],
+            "input_object_ids": input_object_ids,
+            "settlement_effect": admitted_effect,
+            "idempotency_key": f"task-{slug}",
+        }
+    )
+    attempt = service.claim_next(
+        {
+            "executor_id": executor_id,
+            "capability_ids": [CAPABILITY],
+            "runtime_epoch": service.health()["runtime_epoch"],
+        },
+        idempotency_key=f"claim-{slug}",
+    )
+    assert attempt["expected_effect"] == admitted_effect
+    return {
+        "project": project,
+        "input_object_ids": input_object_ids,
+        "effect": admitted_effect,
+        "task": task,
+        "attempt": attempt,
+    }
+
+
+def _video_output(value: bytes, *, name: str = "animated_video") -> dict:
+    output = _output(value, name=name)
+    output["media_type"] = "video/mp4"
+    return output
+
+
+def test_generation_create_with_variant_is_atomic_and_replays_to_one_gallery_generation(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(service)
+        output = b"animated-video-output"
+        first = _settle(
+            service,
+            fixture["attempt"],
+            [_video_output(output)],
+            key="settle",
+            effect=fixture["effect"],
+        )
+        replay = _settle(
+            service,
+            fixture["attempt"],
+            [_video_output(output)],
+            key="settle",
+            effect=fixture["effect"],
+        )
+
+        assert replay == first
+        generation_id = first["data"]["result"]["generation_variant"]["generation_id"]
+        generation = service.get_generation(generation_id)
+        assert generation["project_id"] == fixture["project"]["id"]
+        assert generation["source_task_id"] == fixture["task"]["task"]["id"]
+        assert generation["type"] == "video"
+        assert generation["status"] == "completed"
+        assert generation["version"] == 1
+        assert generation["metadata"]["params"]["tool_type"] == "character_animate"
+        assert generation["metadata"]["input_object_ids"] == fixture["input_object_ids"]
+
+        variants = service.list_variants(generation_id)["items"]
+        assert len(variants) == 1
+        assert variants[0]["object_id"] == _digest(output)
+        assert variants[0]["variant_type"] == "character_animation"
+        assert variants[0]["metadata"]["is_primary"] is True
+        assert variants[0]["metadata"]["input_object_ids"] == fixture["input_object_ids"]
+        assert len(service.list_generations(fixture["project"]["id"])["items"]) == 1
+    finally:
+        service.close()
+
+
+def test_generation_create_with_variant_rejects_wrong_output_without_publishing(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(service, slug="character-output")
+        with pytest.raises(ValidationError, match="output selector did not resolve"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [_video_output(b"wrong-name", name="other_output")],
+                key="wrong-output-settle",
+                effect=fixture["effect"],
+            )
+        digest = _digest(b"wrong-name").removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone() is None
+        assert service.list_generations(fixture["project"]["id"])["items"] == []
+        assert service.store.conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (fixture["task"]["task"]["id"],)
+        ).fetchone()[0] == "running"
+    finally:
+        service.close()
+
+
+def test_generation_create_with_variant_stale_fence_publishes_nothing(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(service, slug="character-fence")
+        attempt = dict(fixture["attempt"])
+        attempt["fence"] = int(attempt["fence"]) + 1
+        with pytest.raises(LeaseError):
+            _settle(
+                service,
+                attempt,
+                [_video_output(b"stale-fence")],
+                key="stale-fence-settle",
+                effect=fixture["effect"],
+            )
+        assert service.list_generations(fixture["project"]["id"])["items"] == []
+        assert service.store.conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (fixture["task"]["task"]["id"],)
+        ).fetchone()[0] == "running"
+    finally:
+        service.close()
+
+
+def test_generation_create_with_variant_cancelled_task_publishes_nothing(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(service, slug="character-cancel")
+        cancelled = service.cancel_task_canonical(
+            fixture["task"]["task"]["id"],
+            {},
+            idempotency_key="cancel-character",
+        )
+        assert cancelled["data"]["state"] == "cancelled"
+        assert service.list_generations(fixture["project"]["id"])["items"] == []
+        assert service.store.conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (fixture["task"]["task"]["id"],)
+        ).fetchone()[0] == "cancelled"
+    finally:
+        service.close()
+
+
+def test_generation_create_with_variant_rejects_foreign_project_target(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        foreign = _new_generation_setup(service, slug="foreign-new-generation")
+        foreign_effect = foreign["effect"]
+        local = _new_generation_setup(
+            service,
+            slug="local-new-generation",
+            effect_override=foreign_effect,
+        )
+        output = b"foreign-target-output"
+        with pytest.raises(ConflictError, match="target project does not match"):
+            _settle(
+                service,
+                local["attempt"],
+                [_video_output(output)],
+                key="foreign-new-generation-settle",
+                effect=foreign_effect,
+            )
+        digest = _digest(output).removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.store.conn.execute(
+            "SELECT 1 FROM objects WHERE digest=?", (digest,)
+        ).fetchone() is None
+        assert service.list_generations(foreign["project"]["id"])["items"] == []
+        assert service.list_generations(local["project"]["id"])["items"] == []
+    finally:
+        service.close()
+
+
+def test_generation_create_with_variant_rejects_malformed_metadata_before_publication(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        fixture = _new_generation_setup(
+            service,
+            slug="malformed-generation",
+            metadata_override={"params": "not-an-object"},
+        )
+        output = b"malformed-metadata-output"
+        with pytest.raises(ValidationError, match="metadata.params must be an object"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [_video_output(output)],
+                key="malformed-generation-settle",
+                effect=fixture["effect"],
+            )
+        digest = _digest(output).removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.store.conn.execute(
+            "SELECT 1 FROM objects WHERE digest=?", (digest,)
+        ).fetchone() is None
+        assert service.list_generations(fixture["project"]["id"])["items"] == []
+    finally:
+        service.close()
 
 
 def test_generation_variant_append_is_atomic_and_replays_deterministically(tmp_path):
