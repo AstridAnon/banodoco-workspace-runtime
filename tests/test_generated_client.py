@@ -111,9 +111,11 @@ def test_generation_intent_round_trips_through_admission_claim_and_terminal_read
             generation_intent=intent,
         )
         assert admitted["generation_intent"] == intent
+        assert "generation_intent" not in admitted["spec"]
 
         task = client.get_task(admitted["task_id"])
         assert task.generation_intent == intent
+        assert "generation_intent" not in task.spec
         worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
         attempt = worker.claim_task(
             executor_id="generation-intent-worker",
@@ -122,6 +124,7 @@ def test_generation_intent_round_trips_through_admission_claim_and_terminal_read
             runtime_epoch=worker.health().runtime_epoch,
         )
         assert attempt.generation_intent == intent
+        assert "generation_intent" not in attempt.spec
         settled = worker.settle_attempt(
             attempt.attempt_id,
             {
@@ -137,6 +140,23 @@ def test_generation_intent_round_trips_through_admission_claim_and_terminal_read
         terminal = client.get_task(task.task_id)
         assert terminal.state == "succeeded"
         assert terminal.generation_intent == intent
+        assert "generation_intent" not in terminal.spec
+
+        # Read a row written by the pre-fix Runtime shape: the legacy key is
+        # accepted for compatibility but never leaks into public spec.
+        row = daemon.service.store.conn.execute(
+            "SELECT spec_json FROM tasks WHERE id=?", (task.task_id,)
+        ).fetchone()
+        legacy_spec = json.loads(row["spec_json"])
+        legacy_spec["generation_intent"] = legacy_spec.pop("__runtime_generation_intent")
+        daemon.service.store.conn.execute(
+            "UPDATE tasks SET spec_json=? WHERE id=?",
+            (json.dumps(legacy_spec, sort_keys=True, separators=(",", ":")), task.task_id),
+        )
+        daemon.service.store.conn.commit()
+        legacy = client.get_task(task.task_id)
+        assert legacy.generation_intent == intent
+        assert "generation_intent" not in legacy.spec
 
         generic = client.admit_task(
             capability_id=capability.capability_id,

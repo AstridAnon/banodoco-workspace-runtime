@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from .cas import ContentAddressedStore
 from .backup import create_backup, restore_backup, structured_export
-from .store import OBJECT_ID_RE, RealmStore, normalize_execution_facts
+from .store import (
+    GENERATION_INTENT_STORAGE_KEY,
+    OBJECT_ID_RE,
+    RealmStore,
+    normalize_execution_facts,
+    public_task_spec,
+)
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 import hashlib
@@ -2385,7 +2391,7 @@ class RuntimeService:
                 raise ValidationError("generation_intent must be an object")
             # Runtime owns transport and durability only. GEN owns the
             # meaning of this opaque producer intent and its member fields.
-            task_spec["generation_intent"] = body["generation_intent"]
+            task_spec[GENERATION_INTENT_STORAGE_KEY] = body["generation_intent"]
         if "required_facts" in body:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
@@ -2488,16 +2494,20 @@ class RuntimeService:
         if not row:
             raise NotFoundError("run not found")
         value = dict(row)
-        value["spec"] = json.loads(value.pop("spec_json"))
+        value["spec"], generation_intent = public_task_spec(json.loads(value.pop("spec_json")))
+        if generation_intent is not None:
+            value["generation_intent"] = generation_intent
         value["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (run_id,))]
         return value
 
     def _task_resource(self, value):
         task, run = value["task"], value["run"]
-        spec = task.get("spec", {})
+        spec, generation_intent = public_task_spec(task.get("spec", {}))
+        if task.get("generation_intent") is not None:
+            generation_intent = task["generation_intent"]
         resource = {"task_id": task["id"], "run_id": run["id"], "project_id": run.get("project_id"), "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "spec": spec, "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
-        if "generation_intent" in spec:
-            resource["generation_intent"] = spec["generation_intent"]
+        if generation_intent is not None:
+            resource["generation_intent"] = generation_intent
         if "required_facts" in spec:
             resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:
@@ -2583,7 +2593,9 @@ class RuntimeService:
 
     def _run_resource(self, value):
         result = dict(value)
-        result["spec"] = json.loads(result.pop("spec_json"))
+        result["spec"], generation_intent = public_task_spec(json.loads(result.pop("spec_json")))
+        if generation_intent is not None:
+            result["generation_intent"] = generation_intent
         result["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (result["id"],))]
         return result
 
@@ -2751,10 +2763,12 @@ class RuntimeService:
             self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
-            admitted_spec = dict(task.get("spec") or {})
+            admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
+            if task.get("generation_intent") is not None:
+                generation_intent = task["generation_intent"]
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
-            if "generation_intent" in admitted_spec:
-                result["generation_intent"] = admitted_spec["generation_intent"]
+            if generation_intent is not None:
+                result["generation_intent"] = generation_intent
             if task.get("expected_effect") is not None:
                 result["expected_effect"] = dict(task["expected_effect"])
             if "required_facts" in admitted_spec:
@@ -3789,7 +3803,9 @@ class RuntimeService:
                 _wire_string(body, field)
         def attempt_resource(attempt):
             task_value = self.store.get_task(attempt["task_id"])
-            admitted_spec = dict(task_value["task"].get("spec") or {})
+            admitted_spec, generation_intent = public_task_spec(task_value["task"].get("spec") or {})
+            if task_value["task"].get("generation_intent") is not None:
+                generation_intent = task_value["task"]["generation_intent"]
             resource = {
                 "attempt_id": attempt["id"],
                 "task_id": attempt["task_id"],
@@ -3801,8 +3817,8 @@ class RuntimeService:
                 "input_object_ids": list(admitted_spec.get("input_object_ids") or []),
                 "spec": admitted_spec,
             }
-            if "generation_intent" in admitted_spec:
-                resource["generation_intent"] = admitted_spec["generation_intent"]
+            if generation_intent is not None:
+                resource["generation_intent"] = generation_intent
             return resource
 
         with self.store._mutex:
