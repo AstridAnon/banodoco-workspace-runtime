@@ -1134,6 +1134,14 @@ class RealmStore:
         predecessors = self._continuation_predecessors(spec)
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
+            if isinstance(expected_effect, dict) and expected_effect.get("effect_type") == "generation.publish_v1":
+                # The typed GEN publication plan is admitted against the task
+                # project before any durable task/run rows are created. Its
+                # output/member semantics are rechecked against staged bytes
+                # inside the fenced settlement transaction.
+                self._validate_settlement_effect(expected_effect, project_id=project_id)
+                if project_id is None:
+                    raise ConflictError("generation.publish_v1 requires a project-scoped task")
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
                 request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
@@ -1894,6 +1902,12 @@ class RealmStore:
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
         kind = effect.get("effect_type")
+        if kind == "generation.publish_v1":
+            return self._validate_generation_publish_v1_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+            )
         if kind == "generation.create_with_variant":
             self._validate_generation_create_with_variant_effect(
                 effect,
@@ -1926,6 +1940,164 @@ class RealmStore:
             raise NotFoundError("settlement effect target project not found", details={"target_id": target}) from exc
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
+
+    @staticmethod
+    def _generation_publish_output_key(output):
+        ordinal = output.get("ordinal", 0)
+        return (
+            output.get("output_port", output.get("name", "output")),
+            output.get("group_key", "default"),
+            output.get("variant_key", str(ordinal)),
+            int(ordinal),
+        )
+
+    def _validate_generation_publish_v1_effect(self, effect, *, project_id=None, result=None):
+        """Validate the exact GEN D1 multi-output publication effect."""
+        if set(effect) != {"effect_type", "target_id", "payload"}:
+            raise ValidationError(
+                "generation.publish_v1 effect has the wrong fields",
+                details={
+                    "required": ["effect_type", "target_id", "payload"],
+                    "unexpected": sorted(set(effect) - {"effect_type", "target_id", "payload"}),
+                },
+            )
+        if effect["effect_type"] != "generation.publish_v1":
+            raise ValidationError("generation.publish_v1 effect_type is invalid")
+        target_id = effect["target_id"]
+        if not isinstance(target_id, str) or not target_id:
+            raise ValidationError("generation.publish_v1 target_id must be a non-empty string")
+        payload = effect["payload"]
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.publish_v1 payload must be an object")
+        required_payload = {
+            "version", "modality", "generation_type", "metadata",
+            "partial_success_policy", "groups",
+        }
+        if set(payload) != required_payload:
+            raise ValidationError(
+                "generation.publish_v1 payload has the wrong fields",
+                details={
+                    "required": sorted(required_payload),
+                    "unexpected": sorted(set(payload) - required_payload),
+                },
+            )
+        if isinstance(payload["version"], bool) or payload["version"] != 1:
+            raise ValidationError("generation.publish_v1 payload.version must be 1")
+        if payload["modality"] not in {"image", "video", "audio"}:
+            raise ValidationError("generation.publish_v1 payload.modality is invalid")
+        if not isinstance(payload["generation_type"], str) or not payload["generation_type"] or len(payload["generation_type"]) > 128:
+            raise ValidationError("generation.publish_v1 generation_type must be a non-empty string of at most 128 characters")
+        if not isinstance(payload["metadata"], dict):
+            raise ValidationError("generation.publish_v1 metadata must be an object")
+        if payload["partial_success_policy"] not in {"reject", "allow"}:
+            raise ValidationError("generation.publish_v1 partial_success_policy is invalid")
+        groups = payload["groups"]
+        if not isinstance(groups, list) or not groups:
+            raise ValidationError("generation.publish_v1 groups must be a non-empty list")
+
+        declared = []
+        seen_groups = set()
+        seen_selectors = set()
+        for group in groups:
+            if not isinstance(group, dict) or set(group) != {"group_key", "selectors"}:
+                raise ValidationError("generation.publish_v1 group requires exactly group_key and selectors")
+            group_key = group["group_key"]
+            if not isinstance(group_key, str) or not group_key or len(group_key) > 255:
+                raise ValidationError("generation.publish_v1 group_key must be a non-empty string")
+            if group_key in seen_groups:
+                raise ValidationError("generation.publish_v1 groups must not contain duplicate group_key")
+            seen_groups.add(group_key)
+            selectors = group["selectors"]
+            if not isinstance(selectors, list) or not selectors:
+                raise ValidationError("generation.publish_v1 selectors must be a non-empty list")
+            group_declarations = []
+            for selector in selectors:
+                if not isinstance(selector, dict) or set(selector) != {"selector", "ordinal", "variant_key", "output_port"}:
+                    raise ValidationError(
+                        "generation.publish_v1 selector requires exactly selector, ordinal, variant_key, and output_port"
+                    )
+                label = selector["selector"]
+                output_port = selector["output_port"]
+                variant_key = selector["variant_key"]
+                ordinal = selector["ordinal"]
+                if not isinstance(label, str) or not label or len(label) > 255:
+                    raise ValidationError("generation.publish_v1 selector must be a non-empty string")
+                if not isinstance(output_port, str) or not output_port or len(output_port) > 255:
+                    raise ValidationError("generation.publish_v1 output_port must be a non-empty string")
+                if not isinstance(variant_key, str) or not variant_key or len(variant_key) > 255:
+                    raise ValidationError("generation.publish_v1 variant_key must be a non-empty string")
+                if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+                    raise ValidationError("generation.publish_v1 ordinal must be a non-negative integer")
+                key = (output_port, group_key, variant_key, ordinal)
+                if key in seen_selectors:
+                    raise ValidationError("generation.publish_v1 selectors must not contain duplicates")
+                seen_selectors.add(key)
+                declaration = {
+                    "selector": label,
+                    "ordinal": ordinal,
+                    "variant_key": variant_key,
+                    "output_port": output_port,
+                }
+                group_declarations.append((key, declaration))
+            declared.append((group_key, group_declarations))
+
+        if project_id is not None:
+            if not project_id:
+                raise ConflictError("generation.publish_v1 requires a project-scoped task")
+            if target_id != str(project_id):
+                raise ConflictError(
+                    "generation.publish_v1 target project does not match the task project",
+                    details={"target_id": target_id, "project_id": project_id},
+                )
+            target_project = self._project(target_id)
+            if target_project["id"] != str(project_id):
+                raise ConflictError(
+                    "generation.publish_v1 target project does not match the task project",
+                    details={"target_id": target_id, "project_id": project_id},
+                )
+        if result is None:
+            return None
+
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list):
+            raise ValidationError("generation.publish_v1 settlement requires an outputs list")
+        output_matches = defaultdict(list)
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            key = self._generation_publish_output_key(output)
+            if any(key == declared_key for _group_key, selectors in declared for declared_key, _selector in selectors):
+                output_matches[key].append(output)
+
+        plan = []
+        selected_count = 0
+        for group_key, selectors in declared:
+            selected = []
+            missing = []
+            for key, declaration in selectors:
+                matches = output_matches.get(key, [])
+                if len(matches) > 1:
+                    raise ValidationError(
+                        "generation.publish_v1 selector matched duplicate outputs",
+                        details={"selector": declaration["selector"], "output_port": declaration["output_port"], "ordinal": declaration["ordinal"]},
+                    )
+                if not matches:
+                    missing.append(declaration)
+                    continue
+                output = matches[0]
+                if output.get("kind") != "object":
+                    raise ValidationError("generation.publish_v1 selectors must resolve verified object outputs")
+                selected.append((key, declaration, output))
+            if payload["partial_success_policy"] == "reject" and missing:
+                raise ValidationError(
+                    "generation.publish_v1 reject policy requires every declared selector",
+                    details={"group_key": group_key, "missing": missing},
+                )
+            selected_count += len(selected)
+            plan.append({"group_key": group_key, "selected": selected, "missing": missing})
+        if selected_count == 0:
+            raise ValidationError("generation.publish_v1 requires at least one successful declared output")
+        return plan
 
     def _validate_generation_create_with_variant_effect(
         self,
@@ -2146,6 +2318,101 @@ class RealmStore:
         input_object_ids=None,
     ):
         kind = effect.get("effect_type")
+        if kind == "generation.publish_v1":
+            plan = self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+            )
+            payload = effect["payload"]
+            publications = []
+            association_overrides = {}
+            for group in plan:
+                group_key = group["group_key"]
+                missing = list(group["missing"])
+                if not group["selected"]:
+                    publications.append({
+                        "group_key": group_key,
+                        "published": [],
+                        "missing_selectors": missing,
+                    })
+                    continue
+                generation_id = "generation-" + hashlib.sha256(
+                    canonical_json({"task_id": str(task_id), "group_key": group_key}).encode()
+                ).hexdigest()
+                timestamp = now()
+                self.conn.execute(
+                    "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
+                    (
+                        generation_id,
+                        str(project_id),
+                        str(task_id),
+                        payload["generation_type"],
+                        canonical_json(payload["metadata"]),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                variants = []
+                for key, declaration, output in group["selected"]:
+                    variant_id = "variant-" + hashlib.sha256(
+                        canonical_json({
+                            "generation_id": generation_id,
+                            "ordinal": declaration["ordinal"],
+                            "variant_key": declaration["variant_key"],
+                        }).encode()
+                    ).hexdigest()
+                    output_digest = output["digest"].removeprefix("sha256:")
+                    variant_metadata = {
+                        "selector": declaration["selector"],
+                        "output_port": declaration["output_port"],
+                        "group_key": group_key,
+                        "variant_key": declaration["variant_key"],
+                        "ordinal": declaration["ordinal"],
+                        "filename": output.get("filename", output.get("name", "output")),
+                        "media_type": output.get("media_type", "application/octet-stream"),
+                        "size": int(output["size"]),
+                        "role": output.get("role") or "output",
+                        "producer": dict(output.get("producer") or {}),
+                        "provenance": dict(output.get("provenance") or {}),
+                        "durability": output.get("durability", "durable"),
+                        "regeneration": output.get("regeneration"),
+                        "coverage": output.get("coverage"),
+                    }
+                    self.conn.execute(
+                        "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            variant_id,
+                            generation_id,
+                            output_digest,
+                            declaration["variant_key"],
+                            canonical_json(variant_metadata),
+                            timestamp,
+                        ),
+                    )
+                    association_overrides[key] = {
+                        "generation_id": generation_id,
+                        "variant_id": variant_id,
+                    }
+                    variants.append({
+                        "variant_id": variant_id,
+                        "generation_id": generation_id,
+                        "object_id": output["digest"],
+                        "variant_key": declaration["variant_key"],
+                        "ordinal": declaration["ordinal"],
+                        "output_port": declaration["output_port"],
+                    })
+                publications.append({
+                    "group_key": group_key,
+                    "generation_id": generation_id,
+                    "variants": variants,
+                    "missing_selectors": missing,
+                })
+            return {
+                "effect_type": "generation.publish_v1",
+                "publications": publications,
+                "_association_overrides": association_overrides,
+            }
         if kind == "generation.create_with_variant":
             self._validate_settlement_effect(
                 effect,
@@ -2372,6 +2639,9 @@ class RealmStore:
             if manifest_output is not None:
                 manifest_digest = str(manifest_output["digest"]).removeprefix("sha256:")
         associations = []
+        publish_overrides = {}
+        if isinstance(applied_effect, dict) and applied_effect.get("effect_type") == "generation.publish_v1":
+            publish_overrides = applied_effect.get("_association_overrides") or {}
         for output in result.get("outputs", []):
             if not isinstance(output, dict) or output.get("kind") != "object":
                 continue
@@ -2379,10 +2649,16 @@ class RealmStore:
             output_port = output.get("output_port", output.get("name", "output"))
             group_key = output.get("group_key", "default")
             variant_key = output.get("variant_key", str(output.get("ordinal", 0)))
-            generation_id = output.get("generation_id")
-            if generation_id is None and isinstance(applied_effect, dict):
-                generation_id = applied_effect.get("generation_id")
             ordinal = int(output.get("ordinal", 0))
+            publish_key = (output_port, group_key, variant_key, ordinal)
+            if isinstance(applied_effect, dict) and applied_effect.get("effect_type") == "generation.publish_v1":
+                generation_id = (publish_overrides.get(publish_key) or {}).get("generation_id")
+            elif isinstance(applied_effect, dict):
+                generation_id = applied_effect.get("generation_id")
+            else:
+                # Producer-supplied generation IDs are never authoritative;
+                # generic managed outputs stay outside the generation domain.
+                generation_id = None
             role = output.get("role") or "output"
             durability = output.get("durability", "durable")
             producer = dict(output.get("producer") or {})
@@ -2582,6 +2858,8 @@ class RealmStore:
                 raise ValidationError("declared settlement effect is required")
             run = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
             task_project_id = run["project_id"] if run else None
+            if effect is not None and effect.get("effect_type") == "generation.publish_v1" and not task_project_id:
+                raise ConflictError("generation.publish_v1 requires a project-scoped task")
             with self._transaction():
                 timestamp = now()
                 # The service stages output bytes before entering this fenced
@@ -2599,6 +2877,7 @@ class RealmStore:
                 append_effect = effect is not None and effect.get("effect_type") in {
                     "generation.variant.append",
                     "generation.create_with_variant",
+                    "generation.publish_v1",
                 }
                 if publish is not None:
                     if append_effect:
@@ -2619,7 +2898,14 @@ class RealmStore:
                 if publish is not None and not append_effect:
                     publish()
                 if applied_effect is not None:
-                    result["generation_variant"] = applied_effect
+                    if effect.get("effect_type") == "generation.publish_v1":
+                        result["generation_publish_v1"] = {
+                            key: value
+                            for key, value in applied_effect.items()
+                            if not key.startswith("_")
+                        }
+                    else:
+                        result["generation_variant"] = applied_effect
                 managed_outputs = self._associate_managed_outputs(
                     result,
                     task_id=task_id,
