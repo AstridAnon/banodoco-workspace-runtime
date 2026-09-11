@@ -92,12 +92,19 @@ class RealmCatalog:
         parent_fd = int(identity["_parent_fd"])
         lock_fd = -1
         try:
-            lock_fd = os.open(
-                self.path.name + ".lock",
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
+            for attempt in range(3):
+                try:
+                    lock_fd = os.open(
+                        self.path.name + ".lock",
+                        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    break
+                except FileNotFoundError:
+                    if attempt == 2:
+                        raise
+                    validate_parent(self.path, identity, allow_parent_appeared=True)
             os.fchmod(lock_fd, 0o600)
             if fcntl is not None:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
