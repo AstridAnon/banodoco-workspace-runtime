@@ -6,6 +6,7 @@ import pytest
 
 from runtime_protocol.errors import ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 CAPABILITY = "render.facts"
@@ -72,7 +73,9 @@ def _claim(service: RuntimeService, key: str):
 
 
 def test_matching_exact_and_minimum_facts_are_returned_and_claimed(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         registered = _register(service)
         assert registered["verified_facts"] == VERIFIED_FACTS
