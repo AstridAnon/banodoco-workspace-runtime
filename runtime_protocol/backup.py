@@ -718,6 +718,8 @@ def restore_backup(
         temporary_name, temporary_fd = mkdir_temp_at(parent_fd, f".{destination.name}.")
         copy_file_at(source_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
         copy_tree_at(source_fd, "cas", temporary_fd, "cas")
+        staging_fd = mkdir_chain_at(temporary_fd, "staging")
+        os.close(staging_fd)
         report, realm = _inspect_consolidated_realm(temporary_fd)
         if not realm or realm["id"] != verified["manifest"].get("realm_id"):
             raise ConflictError("restored realm identity mismatch", details=report)

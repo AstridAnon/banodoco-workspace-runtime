@@ -5,11 +5,18 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+from contextlib import contextmanager
 from typing import Mapping, Any
 
 from .util import atomic_json_write, new_id, now
 from .dirfd import capture_parent, close_pinned, validate_parent
 from .backup import _open_relative
+from .errors import ConflictError
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - supported runtime hosts are POSIX
+    fcntl = None
 
 
 def _safe_path(path: str | Path, label: str) -> Path:
@@ -61,9 +68,46 @@ def process_birth_identity(pid: int | None = None) -> str | None:
 class RealmCatalog:
     """Persistent machine composition state, intentionally separate from realm authority."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, owner_validator=None):
         self.path = _safe_path(path, "catalog path")
         self._path_identity = None
+        self._owner_validator = owner_validator
+
+    def bind_owner(self, owner_validator) -> None:
+        """Require Runtime admission for readiness-bearing catalog writes."""
+        self._owner_validator = owner_validator
+
+    def _require_owner(self, owner):
+        if self._owner_validator is not None:
+            if owner is None or not self._owner_validator(owner):
+                raise ConflictError("catalog mutation requires an admitted runtime owner")
+
+    @contextmanager
+    def _write_lock(self):
+        """Serialize the complete catalog read-modify-write transaction."""
+        if self._path_identity is None:
+            self._path_identity = capture_parent(self.path)
+        identity = self._path_identity
+        validate_parent(self.path, identity, allow_parent_appeared=True)
+        parent_fd = int(identity["_parent_fd"])
+        lock_fd = -1
+        try:
+            lock_fd = os.open(
+                self.path.name + ".lock",
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            os.fchmod(lock_fd, 0o600)
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            validate_parent(self.path, identity, allow_parent_appeared=True)
+            yield identity
+        finally:
+            if lock_fd >= 0:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
 
     def __del__(self):  # pragma: no cover - interpreter cleanup
         try:
@@ -105,24 +149,60 @@ class RealmCatalog:
             if own:
                 close_pinned(identity)
 
-    def register(self, *, realm_id: str, display_name: str, data_root: str, path_identity: Mapping[str, Any] | None = None) -> dict:
+    def register(self, *, realm_id: str, display_name: str, data_root: str, path_identity: Mapping[str, Any] | None = None, owner=None, runtime_epoch=None, runtime_instance_id=None, readiness="ready", readiness_reason=None) -> dict:
+        self._require_owner(owner)
         if not isinstance(realm_id, str) or not realm_id or "/" in realm_id or "\\" in realm_id:
             raise ValueError("realm id must be an opaque path-safe identifier")
         root = _safe_path(data_root, "realm root")
-        catalog = self.read(path_identity=path_identity)
-        realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
-        realms.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(root), "registered_at": now()})
-        catalog.update(version=1, realms=realms, selected_realm_id=catalog.get("selected_realm_id") or realm_id)
-        atomic_json_write(self.path, catalog, identity=path_identity)
-        return catalog
+        if readiness not in {"ready", "not_ready"}:
+            raise ValueError("catalog readiness must be ready or not_ready")
+        if runtime_epoch is not None and (isinstance(runtime_epoch, bool) or int(runtime_epoch) < 1):
+            raise ValueError("runtime epoch must be positive")
+        with self._write_lock() as identity:
+            write_identity = path_identity or identity
+            catalog = self.read(path_identity=write_identity)
+            realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
+            row = {"realm_id": realm_id, "display_name": display_name, "data_root": str(root), "registered_at": now()}
+            if runtime_epoch is not None:
+                row["runtime_epoch"] = int(runtime_epoch)
+            if runtime_instance_id is not None:
+                row["runtime_instance_id"] = str(runtime_instance_id)
+            row["readiness"] = readiness
+            if readiness_reason is not None:
+                row["readiness_reason"] = str(readiness_reason)
+            realms.append(row)
+            catalog.update(version=1, realms=realms, selected_realm_id=catalog.get("selected_realm_id") or realm_id)
+            atomic_json_write(self.path, catalog, identity=write_identity)
+            return catalog
 
-    def select(self, realm_id: str, *, path_identity: Mapping[str, Any] | None = None) -> dict:
-        catalog = self.read(path_identity=path_identity)
-        if not any(row.get("realm_id") == realm_id for row in catalog.get("realms", [])):
-            raise KeyError(realm_id)
-        catalog["selected_realm_id"] = realm_id
-        atomic_json_write(self.path, catalog, identity=path_identity)
-        return catalog
+    def select(self, realm_id: str, *, path_identity: Mapping[str, Any] | None = None, owner=None) -> dict:
+        self._require_owner(owner)
+        with self._write_lock() as identity:
+            write_identity = path_identity or identity
+            catalog = self.read(path_identity=write_identity)
+            if not any(row.get("realm_id") == realm_id for row in catalog.get("realms", [])):
+                raise KeyError(realm_id)
+            catalog["selected_realm_id"] = realm_id
+            atomic_json_write(self.path, catalog, identity=write_identity)
+            return catalog
+
+    def revoke_readiness(self, realm_id: str, *, instance_id: str | None = None, reason="runtime_owner_unavailable") -> dict:
+        """Revoke one advertised owner without trusting a stale owner proof."""
+        with self._write_lock() as identity:
+            catalog = self.read(path_identity=identity)
+            changed = False
+            for row in catalog.get("realms", []):
+                if row.get("realm_id") != realm_id:
+                    continue
+                if instance_id is not None and row.get("runtime_instance_id") != instance_id:
+                    return catalog
+                row["readiness"] = "not_ready"
+                row["readiness_reason"] = str(reason)
+                changed = True
+                break
+            if changed:
+                atomic_json_write(self.path, catalog, identity=identity)
+            return catalog
 
 
 class LiveDiscovery:

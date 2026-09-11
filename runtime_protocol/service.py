@@ -238,6 +238,7 @@ class RuntimeService:
         self.store = RealmStore(root_path, strict_admission=True)
         self._verified = False
         self._admission_failure = None
+        self._readiness_callback = None
         try:
             if not self.store.admission_report.get("ok"):
                 raise RealmAdmissionError(
@@ -266,6 +267,32 @@ class RuntimeService:
     def close(self):
         self.store.close()
 
+    def set_readiness_callback(self, callback) -> None:
+        """Install the daemon-owned readiness revocation hook."""
+        self._readiness_callback = callback
+
+    def catalog_admission(self, instance_id):
+        """Return an unforgeable-in-practice proof for this live owner."""
+        return {
+            "realm_id": self.realm["id"],
+            "runtime_epoch": int(self.store._current_runtime_epoch()),
+            "runtime_session_id": self.runtime_session_id,
+            "runtime_instance_id": str(instance_id),
+        }
+
+    def validate_catalog_admission(self, proof) -> bool:
+        if not self._verified or not isinstance(proof, dict) or self.store._lock_file is None:
+            return False
+        try:
+            return (
+                proof.get("realm_id") == self.realm["id"]
+                and proof.get("runtime_session_id") == self.runtime_session_id
+                and proof.get("runtime_instance_id")
+                and int(proof.get("runtime_epoch")) == int(self.store._current_runtime_epoch())
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
     def backup(self, destination, *, binding=None, destination_identity=None):
         key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
         return create_backup(self.store, destination, binding=binding, key_path=key_path, destination_identity=destination_identity)
@@ -293,6 +320,11 @@ class RuntimeService:
                 # silently resumes writes after observing damaged authority.
                 self._verified = False
                 self._admission_failure = report
+                if self._readiness_callback is not None:
+                    try:
+                        self._readiness_callback(report)
+                    except Exception:
+                        pass
             return report
 
     @_verified_mutation
