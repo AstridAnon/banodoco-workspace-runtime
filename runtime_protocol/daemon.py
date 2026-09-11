@@ -189,10 +189,12 @@ class RuntimeDaemon:
             os.rename(self.root.name, superseded.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             moved_old = True
             os.fsync(parent_fd)
+            validate_parent(self.root, active_identity)
             self._write_replacement_state(state="old_quarantined", candidate=candidate, superseded=superseded)
             os.rename(candidate.name, self.root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             moved_candidate = True
             os.fsync(parent_fd)
+            validate_parent(self.root, active_identity)
             self._write_replacement_state(state="candidate_published", candidate=candidate, superseded=superseded)
             self.instance_id = uuid.uuid4().hex
             self._start(rotate_credentials=True)
@@ -205,9 +207,15 @@ class RuntimeDaemon:
                 pass
             try:
                 parent_fd = int(active_identity["_parent_fd"])
-                if moved_candidate and not candidate.exists() and self.root.exists():
+                def present(name):
+                    try:
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        return False
+                    return True
+                if moved_candidate and not present(candidate.name) and present(self.root.name):
                     os.rename(self.root.name, candidate.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                if moved_old and not self.root.exists() and superseded.exists():
+                if moved_old and not present(self.root.name) and present(superseded.name):
                     os.rename(superseded.name, self.root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 os.fsync(parent_fd)
                 self._write_replacement_state(state="rolled_back", candidate=candidate, superseded=superseded, error=exc)
