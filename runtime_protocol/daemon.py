@@ -130,6 +130,7 @@ class RuntimeDaemon:
         self._provision_credentials(rotate=rotate_credentials)
         self.httpd = RuntimeHTTPServer((self.host, self.port), RuntimeHandler)
         self.httpd.runtime = self.service
+        self.httpd.daemon_runtime = self
         self.httpd.credentials = self.credentials
         owner = self.service.catalog_admission(self.instance_id)
         self.catalog.register(realm_id=self.service.realm["id"], display_name=self.service.realm["display_name"], data_root=str(self.root), owner=owner, runtime_epoch=owner["runtime_epoch"], runtime_instance_id=self.instance_id, readiness="ready")

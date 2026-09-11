@@ -26,6 +26,10 @@ def _parser():
     start.add_argument("--realm-id")
     start.add_argument("--owner-lock")
     start.add_argument("--bootstrap-token-file")
+    create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
+    create.add_argument("--root", required=True)
+    create.add_argument("--display-name", default="Workspace")
+    create.add_argument("--realm-id")
     doctor = sub.add_parser("doctor", help="read-only runtime health check")
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
@@ -36,6 +40,12 @@ def _parser():
     restore = sub.add_parser("restore", help="restore a backup into a new inactive realm")
     restore.add_argument("--backup", required=True)
     restore.add_argument("--destination", required=True)
+    replace = sub.add_parser("replace", help="activate a verified backup as the running realm")
+    replace.add_argument("--root", required=True)
+    replace.add_argument("--backup", required=True)
+    replace.add_argument("--support-root")
+    replace.add_argument("--display-name", default="Workspace")
+    replace.add_argument("--realm-id")
     export = sub.add_parser("export", help="export structured realm state")
     export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
@@ -89,6 +99,14 @@ def main(argv=None):
             result["next_action"] = "banodoco-runtime start"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
+    if args.command == "create":
+        store = RealmStore.initialize(args.root, display_name=args.display_name, realm_id=args.realm_id)
+        try:
+            result = {"state": "created", "realm_id": store.realm["id"], "root": str(store.root)}
+        finally:
+            store.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "backup":
         # Online backup goes through the owning HTTP service. The CLI is an
         # offline surface and must acquire that same realm-owner fence.
@@ -101,6 +119,17 @@ def main(argv=None):
         return 0
     if args.command == "restore":
         result = restore_backup(args.backup, args.destination)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "replace":
+        root = Path(args.root).expanduser().resolve()
+        candidate = root.parent / f".{root.name}.candidate-{os.getpid()}-{time.time_ns()}"
+        daemon = RuntimeDaemon(root, support_root=args.support_root, display_name=args.display_name, realm_id=args.realm_id, production_worker_credentials=True).start()
+        try:
+            daemon.service.restore(args.backup, candidate)
+            result = daemon.activate_candidate(candidate)
+        finally:
+            daemon.stop()
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "export":

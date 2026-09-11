@@ -171,6 +171,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not body.get("backup") or not body.get("destination"):
                 raise ProtocolError("backup and destination are required")
             return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
+        if path == ["v1", "replace"] and method == "POST":
+            self._identity("admin")
+            body = self._body()
+            if not body.get("candidate"):
+                raise ProtocolError("candidate is required")
+            daemon = getattr(self.server, "daemon_runtime", None)
+            if daemon is None:
+                raise ProtocolError("replacement is unavailable outside the owning daemon")
+            return self._send(200, daemon.activate_candidate(body["candidate"]))
         if path == ["v1", "projects", "selection"] and method in ("GET", "PUT"):
             identity = self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
