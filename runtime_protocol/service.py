@@ -2380,6 +2380,12 @@ class RuntimeService:
         capability = body.get("capability_id")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if "generation_intent" in body:
+            if not isinstance(body["generation_intent"], dict):
+                raise ValidationError("generation_intent must be an object")
+            # Runtime owns transport and durability only. GEN owns the
+            # meaning of this opaque producer intent and its member fields.
+            task_spec["generation_intent"] = body["generation_intent"]
         if "required_facts" in body:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
@@ -2490,6 +2496,8 @@ class RuntimeService:
         task, run = value["task"], value["run"]
         spec = task.get("spec", {})
         resource = {"task_id": task["id"], "run_id": run["id"], "project_id": run.get("project_id"), "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "spec": spec, "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
+        if "generation_intent" in spec:
+            resource["generation_intent"] = spec["generation_intent"]
         if "required_facts" in spec:
             resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:
@@ -2745,6 +2753,8 @@ class RuntimeService:
             # must execute exactly what was claimed, without a racy second read.
             admitted_spec = dict(task.get("spec") or {})
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if "generation_intent" in admitted_spec:
+                result["generation_intent"] = admitted_spec["generation_intent"]
             if task.get("expected_effect") is not None:
                 result["expected_effect"] = dict(task["expected_effect"])
             if "required_facts" in admitted_spec:
@@ -3780,7 +3790,7 @@ class RuntimeService:
         def attempt_resource(attempt):
             task_value = self.store.get_task(attempt["task_id"])
             admitted_spec = dict(task_value["task"].get("spec") or {})
-            return {
+            resource = {
                 "attempt_id": attempt["id"],
                 "task_id": attempt["task_id"],
                 "project_id": task_value["run"].get("project_id"),
@@ -3791,6 +3801,9 @@ class RuntimeService:
                 "input_object_ids": list(admitted_spec.get("input_object_ids") or []),
                 "spec": admitted_spec,
             }
+            if "generation_intent" in admitted_spec:
+                resource["generation_intent"] = admitted_spec["generation_intent"]
+            return resource
 
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
