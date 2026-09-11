@@ -14,8 +14,9 @@ from runtime_protocol.backup import verify_restore_candidate
 from runtime_protocol.cli import main as runtime_main
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, RealmAdmissionError, ValidationError
+from runtime_protocol.canonical_schema import CANONICAL_FORMAT_ID
 from runtime_protocol.service import RuntimeService
-from runtime_protocol.store import RealmStore
+from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 
 
 def _tree_bytes(root: Path) -> dict[str, str]:
@@ -26,6 +27,11 @@ def _tree_bytes(root: Path) -> dict[str, str]:
         for path in root.rglob("*")
         if path.is_file() and not path.is_symlink()
     }
+
+
+def _new_service(root: Path, **kwargs):
+    RealmStore.initialize(root).close()
+    return RuntimeService(root, **kwargs)
 
 
 def test_corrupt_startup_fails_before_credentials_catalog_discovery_or_server(tmp_path):
@@ -120,7 +126,7 @@ def test_preflight_migrates_only_its_isolated_copy_before_rejecting_bad_schema(t
 
 def test_existing_realm_missing_attempts_table_fails_admission(tmp_path):
     root = tmp_path / "realm"
-    RuntimeService(root).close()
+    RealmStore.initialize(root).close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         connection.execute("DROP TABLE attempts")
@@ -139,7 +145,7 @@ def test_existing_realm_missing_attempts_table_fails_admission(tmp_path):
 
 def test_existing_realm_missing_required_column_fails_admission_with_schema_details(tmp_path):
     root = tmp_path / "realm"
-    RuntimeService(root).close()
+    RealmStore.initialize(root).close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         connection.execute("ALTER TABLE attempts DROP COLUMN lease_id")
@@ -152,10 +158,15 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
     assert report["issues"] == ["schema"]
     assert report["checks"]["schema"] == {
         "ok": False,
-        "expected_version": 23,
-        "actual_version": 23,
+        "expected_format_id": CANONICAL_FORMAT_ID,
+        "actual_format_id": CANONICAL_FORMAT_ID,
+        "expected_version": SCHEMA_VERSION,
+        "actual_version": SCHEMA_VERSION,
         "missing_tables": [],
         "missing_columns": {"attempts": ["lease_id"]},
+        "extra_columns": {},
+        "unexpected_tables": [],
+        "legacy_tables": [],
     }
     with pytest.raises(RealmAdmissionError) as error:
         RuntimeService(root)
@@ -172,7 +183,7 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
 )
 def test_existing_realm_requires_one_unambiguous_identity(tmp_path, mutation, reason):
     root = tmp_path / "realm"
-    RuntimeService(root).close()
+    RealmStore.initialize(root).close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         if mutation == "missing":
@@ -251,7 +262,7 @@ def test_wal_only_commit_survives_owned_backup_and_restore(tmp_path):
 
 
 def test_candidate_verification_is_byte_safe_and_rejects_unmanifested_sidecars(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         backup = tmp_path / "backup"
         candidate = tmp_path / "candidate"
