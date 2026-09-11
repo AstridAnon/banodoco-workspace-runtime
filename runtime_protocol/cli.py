@@ -96,7 +96,7 @@ def main(argv=None):
             catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None,
         )
         if result.get("state") == "uninitialized":
-            result["next_action"] = "banodoco-runtime start"
+            result["next_action"] = "banodoco-runtime create --root <realm>"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
     if args.command == "create":
