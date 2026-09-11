@@ -104,7 +104,9 @@ def test_matching_exact_and_minimum_facts_are_returned_and_claimed(tmp_path):
     ],
 )
 def test_missing_or_mismatched_fact_stays_queued_with_deterministic_reason(tmp_path, kind, key):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         _register(service)
         required = copy.deepcopy(VERIFIED_FACTS)
@@ -124,7 +126,9 @@ def test_missing_or_mismatched_fact_stays_queued_with_deterministic_reason(tmp_p
 
 
 def test_missing_verified_facts_fails_closed_only_for_fact_bound_tasks(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         _register(service, facts={"exact": {}, "minimum": {}})
         admitted = _task(service, "missing-facts", {"exact": {"driver": "cuda"}})
@@ -136,7 +140,9 @@ def test_missing_verified_facts_fails_closed_only_for_fact_bound_tasks(tmp_path)
 
 
 def test_fact_maps_reject_backend_or_unknown_policy(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         service.register_capability({"capability_id": CAPABILITY, "definition_digest": DIGEST})
         with pytest.raises(ValidationError, match="unsupported facts"):
