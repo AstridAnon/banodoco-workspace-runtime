@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -54,7 +54,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "media_references": frozenset("id reference_id media_id role ordinal is_primary metadata_json created_at".split()),
     "media_relations": frozenset("project_id from_digest to_digest kind ordinal metadata_json created_at".split()),
     "managed_output_associations": frozenset("association_id task_id attempt_id project_id output_port group_key generation_id variant_key object_digest manifest_digest size filename media_type ordinal role producer_json provenance_json durability regeneration_json coverage_json created_at".split()),
-    "managed_output_lifecycle": frozenset("association_id state version expires_at pinned_at updated_at created_at".split()),
+    "managed_output_lifecycle": frozenset("association_id state version expires_at pinned_at lease_id lease_owner lease_expires_at updated_at created_at".split()),
     "objects": frozenset("digest size media_type original_name created_at".split()),
     "project_documents": frozenset("id project_id kind content_json version created_at updated_at".split()),
     "project_objects": frozenset("project_id digest relation created_at".split()),
@@ -2265,9 +2265,31 @@ class RealmStore:
             value[field.removesuffix("_json")] = json.loads(value[field]) if value[field] is not None else None
             value.pop(field)
         value["object_id"] = "sha256:" + value.pop("object_digest")
+        value["digest"] = value["object_id"]
         if value.get("manifest_digest"):
             value["manifest_ref"] = "sha256:" + value.pop("manifest_digest")
+        else:
+            value.pop("manifest_digest", None)
+            value["manifest_ref"] = None
+        value["selector"] = {"group_key": value["group_key"], "variant_key": value["variant_key"]}
+        value["lifecycle"] = {
+            "state": value["state"], "version": int(value["version"]),
+            "expires_at": value["expires_at"], "pinned_at": value["pinned_at"],
+            "lease_id": value.get("lease_id"), "lease_owner": value.get("lease_owner"),
+            "lease_expires_at": value.get("lease_expires_at"),
+            "updated_at": value["lifecycle_updated_at"],
+        }
         return value
+
+    @staticmethod
+    def _managed_output_select():
+        return (
+            "SELECT a.*, t.run_id AS run_id, l.state, l.version, l.expires_at, l.pinned_at, "
+            "l.lease_id, l.lease_owner, l.lease_expires_at, l.updated_at AS lifecycle_updated_at "
+            "FROM managed_output_associations a "
+            "JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+            "JOIN tasks t ON t.id=a.task_id "
+        )
 
     def _associate_managed_outputs(self, result, *, task_id, attempt_id, project_id, applied_effect=None):
         """Persist immutable output identity and initial Runtime lifecycle atomically."""
@@ -2294,11 +2316,25 @@ class RealmStore:
             ordinal = int(output.get("ordinal", 0))
             role = output.get("role") or "output"
             durability = output.get("durability", "durable")
-            producer = output.get("producer") or {}
+            producer = dict(output.get("producer") or {})
             provenance = dict(output.get("provenance") or {})
+            task_row = self.conn.execute("SELECT capability FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+            attempt_row = self.conn.execute(
+                "SELECT executor_id, fence, runtime_epoch FROM attempts WHERE id=?",
+                (str(attempt_id),),
+            ).fetchone()
+            if task_row:
+                producer.setdefault("capability_id", task_row["capability"])
             provenance.setdefault("task_id", str(task_id))
             provenance.setdefault("attempt_id", str(attempt_id))
-            provenance.setdefault("runtime_epoch", self._current_runtime_epoch())
+            if task_row:
+                provenance.setdefault("capability_id", task_row["capability"])
+            if attempt_row:
+                provenance.setdefault("executor_id", attempt_row["executor_id"])
+                provenance.setdefault("fence", int(attempt_row["fence"]))
+                provenance.setdefault("runtime_epoch", int(attempt_row["runtime_epoch"]))
+            else:
+                provenance.setdefault("runtime_epoch", self._current_runtime_epoch())
             identity = {
                 "task_id": str(task_id), "output_port": output_port,
                 "group_key": group_key, "generation_id": generation_id,
@@ -2326,12 +2362,11 @@ class RealmStore:
             )
             lifecycle_state = "temporary" if durability == "temporary" else "available"
             self.conn.execute(
-                "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, ?, ?)",
+                "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, lease_id, lease_owner, lease_expires_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL, ?, ?)",
                 (association_id, lifecycle_state, now(), now()),
             )
             row = self.conn.execute(
-                "SELECT a.*, l.state, l.version, l.expires_at, l.pinned_at, l.updated_at AS lifecycle_updated_at "
-                "FROM managed_output_associations a JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+                self._managed_output_select() +
                 "WHERE a.association_id=?",
                 (association_id,),
             ).fetchone()
@@ -2341,12 +2376,118 @@ class RealmStore:
     def list_managed_outputs(self, task_id):
         with self._mutex:
             rows = self.conn.execute(
-                "SELECT a.*, l.state, l.version, l.expires_at, l.pinned_at, l.updated_at AS lifecycle_updated_at "
-                "FROM managed_output_associations a JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+                self._managed_output_select() +
                 "WHERE a.task_id=? ORDER BY a.created_at, a.association_id",
                 (str(task_id),),
             ).fetchall()
             return [self._managed_output_value(row) for row in rows]
+
+    def get_managed_output(self, association_id):
+        with self._mutex:
+            row = self.conn.execute(
+                self._managed_output_select() + "WHERE a.association_id=?",
+                (str(association_id),),
+            ).fetchone()
+        if not row:
+            raise NotFoundError("managed output not found")
+        return self._managed_output_value(row)
+
+    def update_managed_output_lifecycle(
+        self, association_id, operation, *, expected_version, lease_id=None,
+        lease_owner=None, lease_seconds=None,
+    ):
+        """Apply one Runtime-owned lifecycle transition in the caller's transaction."""
+        row = self.conn.execute(
+            self._managed_output_select() + "WHERE a.association_id=?",
+            (str(association_id),),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("managed output not found")
+        try:
+            expected = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("managed output expected_version must be a positive integer") from exc
+        if expected < 1:
+            raise ValidationError("managed output expected_version must be a positive integer")
+        actual = int(row["version"])
+        if expected != actual:
+            raise ConflictError(
+                "managed output lifecycle version conflict",
+                details={"expected": expected, "actual": actual},
+            )
+        if operation not in {"lease", "release", "pin", "unpin", "expire", "reclaim", "promote"}:
+            raise ValidationError("unsupported managed output lifecycle operation")
+
+        state = row["state"]
+        pinned_at = row["pinned_at"]
+        current_lease_id = row["lease_id"]
+        current_lease_owner = row["lease_owner"]
+        current_lease_expires = row["lease_expires_at"]
+        timestamp = now()
+        active_lease = bool(current_lease_id and current_lease_expires and current_lease_expires > timestamp)
+        next_state = state
+        next_expires = row["expires_at"]
+        next_lease_id = current_lease_id
+        next_lease_owner = current_lease_owner
+        next_lease_expires = current_lease_expires
+        if operation == "lease":
+            if state in {"expired", "reclaimed"}:
+                raise ConflictError("managed output is not leaseable", details={"state": state})
+            if active_lease and lease_id and str(lease_id) != str(current_lease_id):
+                raise ConflictError("managed output lease is held by another owner")
+            if lease_seconds is None:
+                raise ValidationError("managed output lease_seconds is required")
+            if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+                raise ValidationError("managed output lease_seconds must be a positive integer")
+            next_lease_id = str(lease_id or current_lease_id or "managed-lease-" + new_id())
+            next_lease_owner = str(lease_owner or current_lease_owner or "managed-output-client")
+            next_lease_expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        elif operation == "release":
+            if active_lease and lease_id and str(lease_id) != str(current_lease_id):
+                raise ConflictError("managed output lease does not belong to caller")
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        elif operation == "pin":
+            if state in {"expired", "reclaimed"}:
+                raise ConflictError("managed output cannot be pinned", details={"state": state})
+            pinned_at = pinned_at or timestamp
+        elif operation == "unpin":
+            pinned_at = None
+        elif operation == "expire":
+            if state != "temporary":
+                raise ConflictError("only temporary managed outputs can expire", details={"state": state})
+            if pinned_at or active_lease:
+                raise ConflictError("managed output is protected from expiry")
+            next_state = "expired"
+            next_expires = next_expires or timestamp
+        elif operation == "reclaim":
+            if state != "expired":
+                raise ConflictError("only expired managed outputs can be reclaimed", details={"state": state})
+            if pinned_at or active_lease:
+                raise ConflictError("managed output is protected from reclaim")
+            next_state = "reclaimed"
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        elif operation == "promote":
+            if state not in {"available", "temporary"}:
+                raise ConflictError("managed output cannot be promoted", details={"state": state})
+            if row["project_id"] is None:
+                raise ConflictError("managed output promotion requires a project association")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'promoted', ?)",
+                (row["project_id"], row["object_digest"], timestamp),
+            )
+            next_state = "promoted"
+            next_expires = None
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        changed = self.conn.execute(
+            "UPDATE managed_output_lifecycle SET state=?, version=?, expires_at=?, pinned_at=?, lease_id=?, lease_owner=?, lease_expires_at=?, updated_at=? WHERE association_id=? AND version=?",
+            (
+                next_state, actual + 1, next_expires, pinned_at, next_lease_id,
+                next_lease_owner, next_lease_expires, timestamp, str(association_id), actual,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ConflictError("managed output lifecycle changed during update")
+        return self.get_managed_output(association_id)
 
     def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None, record=None):
         with self._mutex:

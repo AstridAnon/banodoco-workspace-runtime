@@ -143,6 +143,28 @@ paths:
       operationId: listProjectTasks
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } } }
+  /v1/tasks/{task_id}/managed-outputs:
+    get:
+      operationId: listManagedOutputs
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses: { '200': { description: Runtime-owned managed output associations for a task, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputPage' } } } } }
+  /v1/managed-outputs/{association_id}:
+    get:
+      operationId: getManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' } ]
+      responses: { '200': { description: One immutable managed output association and mutable lifecycle readback, content: { application/json: { schema: { $ref: './schemas/managed-output.json' } } } } }
+  /v1/managed-outputs/{association_id}/adopt:
+    post:
+      operationId: adoptManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputAdoption' } } } }
+      responses: { '200': { description: Named managed association adoption with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/lifecycle:
+    post:
+      operationId: updateManagedOutputLifecycle
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputLifecycle' } } } }
+      responses: { '200': { description: Runtime lifecycle mutation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/runs:
     get:
       operationId: listProjectRuns
@@ -587,6 +609,7 @@ components:
     ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
     ObjectId: { name: object_id, in: path, required: true, schema: { type: string } }
     TaskId: { name: task_id, in: path, required: true, schema: { type: string } }
+    AssociationId: { name: association_id, in: path, required: true, schema: { type: string, minLength: 1 } }
     RunId: { name: run_id, in: path, required: true, schema: { type: string } }
     AttemptId: { name: attempt_id, in: path, required: true, schema: { type: string } }
     TimelineId: { name: timeline_id, in: path, required: true, schema: { type: string } }
@@ -739,6 +762,38 @@ components:
       additionalProperties: false
       required: [items, next_cursor]
       properties: { items: { type: array, items: { $ref: './schemas/managed-object.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/managed-output.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputAdoption:
+      type: object
+      additionalProperties: false
+      properties:
+        association_id: { type: string, minLength: 1 }
+        manifest_ref: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        size: { type: integer, minimum: 0 }
+        filename: { type: string, minLength: 1 }
+        media_type: { type: string, minLength: 1 }
+        output_port: { type: string, minLength: 1 }
+        selector: { type: object, additionalProperties: true }
+        ordinal: { type: integer, minimum: 0 }
+        role: { type: string, minLength: 1 }
+        durability: { type: string, enum: [durable, temporary] }
+    ManagedOutputLifecycle:
+      type: object
+      additionalProperties: false
+      required: [operation, expected_version]
+      properties:
+        operation: { type: string, enum: [lease, release, pin, unpin, expire, reclaim, promote] }
+        expected_version: { type: integer, minimum: 1 }
+        lease_id: { type: string, minLength: 1 }
+        lease_owner: { type: string, minLength: 1 }
+        lease_seconds: { type: integer, minimum: 1 }
+        provenance: { type: object, additionalProperties: true }
     TimelineRevisionPage:
       type: object
       additionalProperties: false
