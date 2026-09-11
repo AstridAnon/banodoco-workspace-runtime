@@ -15,7 +15,7 @@ class CredentialStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
 
-    def provision(self, actor: str, scopes: list[str], *, metadata: dict | None = None) -> tuple[str, Path]:
+    def provision(self, actor: str, scopes: list[str], *, metadata: dict | None = None, rotate: bool = False) -> tuple[str, Path]:
         if not actor or "/" in actor or ".." in actor:
             raise ValidationError("invalid actor")
         expected_scopes = sorted(set(str(scope) for scope in scopes))
@@ -26,7 +26,7 @@ class CredentialStore:
         # must not rotate the worker identity behind a surviving host process,
         # while an old/broadened credential must never be silently retained.
         try:
-            if (path.is_file() and not path.is_symlink()
+            if not rotate and (path.is_file() and not path.is_symlink()
                     and metadata_path.is_file() and not metadata_path.is_symlink()
                     and path.stat().st_mode & 0o777 == 0o600
                     and metadata_path.stat().st_mode & 0o777 == 0o600):
