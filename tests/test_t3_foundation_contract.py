@@ -145,7 +145,15 @@ def test_generic_settlement_associates_outputs_atomically_without_generation_row
             variant_key="original",
             ordinal=0,
             role="video",
-            coverage="full",
+            coverage={
+                "sampling": {
+                    "mode": "interval",
+                    "range": {"start": 0, "end": 1},
+                    "step_frames_rational": "1/1",
+                    "every": 1,
+                    "cards": [{"frame": 0, "time_seconds": 0, "time_rational": "0/1", "sample_reasons": ["interval"]}],
+                },
+            },
         )
         manifest_output = _output(
             manifest,

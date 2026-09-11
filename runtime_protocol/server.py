@@ -464,6 +464,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("tasks:read")
                 value = self.runtime.task(task_id)
                 return self._send(200, self.runtime._task_resource(value))
+        if len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "managed-outputs" and method == "GET":
+            self._identity("tasks:read")
+            return self._send(200, self.runtime.managed_output_page(path[2]))
+        if len(path) == 3 and path[:2] == ["v1", "managed-outputs"]:
+            if method == "GET":
+                self._identity("tasks:read")
+                return self._send(200, self.runtime.managed_output(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "managed-outputs"]:
+            association_id, action = path[2:]
+            if action == "adopt" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.adopt_managed_output(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            if action == "lifecycle" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
             self._identity("tasks:write")

@@ -149,6 +149,40 @@ export const SCHEMA_MANIFEST_SHA256 = "${schemaDigest}" as const;
 export const OPERATIONS = ${JSON.stringify(operationIds)} as const;
 export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
+export type ManagedOutputDurability = "durable" | "temporary";
+export type ManagedCoverageMode = "interval" | "clips" | "cuts" | "shots";
+export interface ManagedOutput {
+  association_id: string;
+  project_id: string | null;
+  run_id: string;
+  task_id: string;
+  attempt_id: string;
+  output_port: string;
+  group_key: string;
+  variant_key: string;
+  selector: { group_key: string; variant_key: string };
+  object_id: string;
+  digest: string;
+  manifest_ref: string | null;
+  size: number;
+  filename: string;
+  media_type: string;
+  ordinal: number;
+  role: string;
+  producer: Record<string, unknown>;
+  provenance: Record<string, unknown>;
+  durability: ManagedOutputDurability;
+  regeneration?: Record<string, unknown> | null;
+  coverage?: Record<string, unknown> | null;
+  state: string;
+  version: number;
+  lifecycle: Record<string, unknown>;
+  [key: string]: unknown;
+}
+export interface ManagedOutputPage { items: ManagedOutput[]; next_cursor: string | null; }
+export interface ManagedOutputAdoption { association_id?: string; manifest_ref?: string | null; object_id?: string; digest?: string; size?: number; filename?: string; media_type?: string; output_port?: string; selector?: Record<string, unknown>; ordinal?: number; role?: string; durability?: ManagedOutputDurability; }
+export interface ManagedOutputLifecycle { operation: "lease" | "release" | "pin" | "unpin" | "expire" | "reclaim" | "promote"; expected_version: number; lease_id?: string; lease_owner?: string; lease_seconds?: number; provenance?: Record<string, unknown>; }
+export type MutationResult<T> = T & { readonly receipt: Record<string, unknown> };
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string, public request_id = "", public details: Record<string, unknown> = {}) {
@@ -180,6 +214,33 @@ export class WorkspaceClient {
       throw new ApiError(response.status, String(value.code ?? "http_error"), String(value.message ?? ("HTTP " + response.status)), String(value.request_id ?? ""), (value.details ?? {}) as Record<string, unknown>);
     }
     return response;
+  }
+
+  private json<T>(body: Uint8Array): T { return JSON.parse(new TextDecoder().decode(body)) as T; }
+  private page<T>(body: Uint8Array): { items: T[]; next_cursor: string | null } {
+    const value = this.json<{ items: T[]; next_cursor: string | null }>(body);
+    if (!Array.isArray(value.items) || (value.next_cursor !== null && typeof value.next_cursor !== "string")) throw new Error("invalid page response");
+    return value;
+  }
+  private mutation<T>(body: Uint8Array): MutationResult<T> {
+    const value = this.json<{ data?: T; receipt?: Record<string, unknown> }>(body);
+    if (!value.data || !value.receipt) throw new Error("invalid mutation response: committed receipt is required");
+    return Object.assign(value.data, { receipt: value.receipt }) as MutationResult<T>;
+  }
+  async listManagedOutputs(taskId: string, cursor?: string, limit = 50): Promise<ManagedOutputPage> {
+    const query = "?limit=" + limit + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+    return this.page<ManagedOutput>(
+      (await this.call("listManagedOutputs", "GET", "/v1/tasks/" + encodeURIComponent(taskId) + "/managed-outputs" + query)).body,
+    );
+  }
+  async getManagedOutput(associationId: string): Promise<ManagedOutput> {
+    return this.json<ManagedOutput>((await this.call("getManagedOutput", "GET", "/v1/managed-outputs/" + encodeURIComponent(associationId))).body);
+  }
+  async adoptManagedOutput(associationId: string, idempotencyKey: string, body: ManagedOutputAdoption = {}): Promise<MutationResult<ManagedOutput>> {
+    return this.mutation<ManagedOutput>((await this.call("adoptManagedOutput", "POST", "/v1/managed-outputs/" + encodeURIComponent(associationId) + "/adopt", new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+  }
+  async updateManagedOutputLifecycle(associationId: string, body: ManagedOutputLifecycle, idempotencyKey: string): Promise<MutationResult<ManagedOutput>> {
+    return this.mutation<ManagedOutput>((await this.call("updateManagedOutputLifecycle", "POST", "/v1/managed-outputs/" + encodeURIComponent(associationId) + "/lifecycle", new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
   }
 }
 `;

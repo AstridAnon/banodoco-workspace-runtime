@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/managed-output.json",
+  "title": "Runtime managed output association",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "association_id", "project_id", "run_id", "task_id", "attempt_id",
+    "output_port", "group_key", "variant_key", "selector", "object_id",
+    "digest", "manifest_ref", "size", "filename", "media_type", "ordinal",
+    "role", "producer", "provenance", "durability", "state", "version",
+    "lifecycle"
+  ],
+  "properties": {
+    "association_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": ["string", "null"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "attempt_id": { "type": "string", "minLength": 1 },
+    "output_port": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "group_key": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "variant_key": { "type": "string", "maxLength": 255 },
+    "selector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["group_key", "variant_key"],
+      "properties": {
+        "group_key": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "variant_key": { "type": "string", "maxLength": 255 }
+      }
+    },
+    "generation_id": { "type": ["string", "null"] },
+    "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "manifest_ref": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "size": { "type": "integer", "minimum": 0 },
+    "filename": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "media_type": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "ordinal": { "type": "integer", "minimum": 0 },
+    "role": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "producer": { "type": "object" },
+    "provenance": { "type": "object" },
+    "durability": { "type": "string", "enum": ["durable", "temporary"] },
+    "regeneration": {
+      "type": ["object", "null"], "additionalProperties": false,
+      "required": ["available", "capability_id", "source_refs", "recipe_digest", "exact_inputs"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "capability_id": { "type": ["string", "null"] },
+        "source_refs": { "type": "array", "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } },
+        "recipe_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "exact_inputs": { "type": ["object", "array"] }
+      }
+    },
+    "coverage": {
+      "type": ["object", "null"], "additionalProperties": false,
+      "required": ["sampling"],
+      "properties": {
+        "sampling": {
+          "type": "object", "additionalProperties": false,
+          "required": ["mode", "range"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["interval", "clips", "cuts", "shots"] },
+            "range": {
+              "type": "object", "additionalProperties": false,
+              "required": ["start", "end"],
+              "properties": {
+                "start": { "type": "integer", "minimum": 0 },
+                "end": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "step_frames_rational": { "type": "string", "pattern": "^[0-9]+/[1-9][0-9]*$" },
+            "every": { "type": "number", "exclusiveMinimum": 0 },
+            "every_frames": { "type": "integer", "minimum": 1 },
+            "cards": {
+              "type": "array",
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["frame", "time_seconds", "time_rational", "sample_reasons"],
+                "properties": {
+                  "frame": { "type": "integer", "minimum": 0 },
+                  "time_seconds": { "type": "number", "minimum": 0 },
+                  "time_rational": { "type": "string", "pattern": "^[0-9]+/[1-9][0-9]*$" },
+                  "sample_reasons": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"] } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "state": { "type": "string", "enum": ["available", "temporary", "expired", "promoted", "reclaimed"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "expires_at": { "type": ["string", "null"] },
+    "pinned_at": { "type": ["string", "null"] },
+    "lease_id": { "type": ["string", "null"] },
+    "lease_owner": { "type": ["string", "null"] },
+    "lease_expires_at": { "type": ["string", "null"] },
+    "lifecycle_updated_at": { "type": "string" },
+    "lifecycle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "version", "expires_at", "pinned_at", "lease_id", "lease_owner", "lease_expires_at", "updated_at"],
+      "properties": {
+        "state": { "type": "string" }, "version": { "type": "integer", "minimum": 1 },
+        "expires_at": { "type": ["string", "null"] }, "pinned_at": { "type": ["string", "null"] },
+        "lease_id": { "type": ["string", "null"] }, "lease_owner": { "type": ["string", "null"] },
+        "lease_expires_at": { "type": ["string", "null"] }, "updated_at": { "type": "string" }
+      }
+    },
+    "created_at": { "type": "string" }
+  }
+}

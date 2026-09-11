@@ -32,13 +32,133 @@ REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
-MANAGED_COVERAGE_KINDS = frozenset({"full", "range", "members", "sampled"})
+MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
+MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
 MANAGED_DURABILITIES = frozenset({"durable", "temporary"})
 TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
 TEXT_BINDING_MAX_BYTES = 1_048_576
 TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
 MEDIA_PROBE_TIMEOUT_SECONDS = 10
+
+
+def _validate_rational(value, field):
+    """Validate the V1 exact rational wire form without floating-point loss."""
+    if isinstance(value, str):
+        match = re.fullmatch(r"([0-9]+)/([1-9][0-9]*)", value)
+        if match:
+            return value
+    elif isinstance(value, dict) and set(value) == {"numerator", "denominator"}:
+        numerator, denominator = value["numerator"], value["denominator"]
+        if (
+            isinstance(numerator, int) and not isinstance(numerator, bool) and numerator >= 0
+            and isinstance(denominator, int) and not isinstance(denominator, bool) and denominator > 0
+        ):
+            return {"numerator": numerator, "denominator": denominator}
+    raise ValidationError(f"{field} must be a non-negative rational")
+
+
+def _validate_coverage(value):
+    """Validate the V1 sampling evidence carried by a managed output."""
+    if not isinstance(value, dict) or set(value) != {"sampling"}:
+        raise ValidationError(
+            "output coverage must contain only V1 sampling evidence",
+            details={"required": "sampling", "modes": sorted(MANAGED_COVERAGE_MODES)},
+        )
+    sampling = value["sampling"]
+    if not isinstance(sampling, dict):
+        raise ValidationError("output coverage.sampling must be an object")
+    allowed = {"mode", "range", "step_frames_rational", "every", "every_frames", "cards"}
+    unknown = set(sampling) - allowed
+    if unknown:
+        raise ValidationError("output coverage.sampling contains unsupported fields", details={"fields": sorted(unknown)})
+    mode = sampling.get("mode")
+    if mode not in MANAGED_COVERAGE_MODES:
+        raise ValidationError("output coverage.sampling.mode is invalid", details={"modes": sorted(MANAGED_COVERAGE_MODES)})
+    rendered_range = sampling.get("range")
+    if not isinstance(rendered_range, dict) or set(rendered_range) != {"start", "end"}:
+        raise ValidationError("output coverage.sampling.range must be a half-open object")
+    start, end = rendered_range["start"], rendered_range["end"]
+    if (
+        isinstance(start, bool) or not isinstance(start, int) or start < 0
+        or isinstance(end, bool) or not isinstance(end, int) or end <= start
+    ):
+        raise ValidationError("output coverage.sampling.range must satisfy 0 <= start < end")
+    if "step_frames_rational" in sampling:
+        _validate_rational(sampling["step_frames_rational"], "output coverage.sampling.step_frames_rational")
+    if "every" in sampling and "every_frames" in sampling:
+        raise ValidationError("output coverage.sampling.every and every_frames are mutually exclusive")
+    if ("every" in sampling or "every_frames" in sampling) and mode != "interval":
+        raise ValidationError("output coverage.sampling.every/every_frames are valid only for interval mode")
+    if "every" in sampling and (
+        isinstance(sampling["every"], bool) or not isinstance(sampling["every"], (int, float))
+        or not math.isfinite(float(sampling["every"])) or float(sampling["every"]) <= 0
+    ):
+        raise ValidationError("output coverage.sampling.every must be a positive finite number")
+    if "every_frames" in sampling and (
+        isinstance(sampling["every_frames"], bool) or not isinstance(sampling["every_frames"], int)
+        or sampling["every_frames"] <= 0
+    ):
+        raise ValidationError("output coverage.sampling.every_frames must be a positive integer")
+    cards = sampling.get("cards", [])
+    if not isinstance(cards, list):
+        raise ValidationError("output coverage.sampling.cards must be a list")
+    for card in cards:
+        if not isinstance(card, dict) or set(card) != {"frame", "time_seconds", "time_rational", "sample_reasons"}:
+            raise ValidationError("each coverage card requires frame, time_seconds, time_rational, and sample_reasons")
+        if isinstance(card["frame"], bool) or not isinstance(card["frame"], int) or card["frame"] < 0:
+            raise ValidationError("coverage card frame must be a non-negative integer")
+        if (
+            isinstance(card["time_seconds"], bool) or not isinstance(card["time_seconds"], (int, float))
+            or not math.isfinite(float(card["time_seconds"])) or float(card["time_seconds"]) < 0
+        ):
+            raise ValidationError("coverage card time_seconds must be a non-negative finite number")
+        _validate_rational(card["time_rational"], "coverage card time_rational")
+        reasons = card["sample_reasons"]
+        if not isinstance(reasons, list) or not reasons or any(reason not in MANAGED_COVERAGE_REASONS for reason in reasons):
+            raise ValidationError("coverage card sample_reasons contains an invalid reason")
+    return value
+
+
+def _contains_latest(value):
+    if isinstance(value, str):
+        return value.lower() == "latest"
+    if isinstance(value, dict):
+        return any(_contains_latest(key) or _contains_latest(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_latest(item) for item in value)
+    return False
+
+
+def _validate_regeneration(value):
+    """Validate the immutable regeneration declaration, including unavailable."""
+    if not isinstance(value, dict) or set(value) != {"available", "capability_id", "source_refs", "recipe_digest", "exact_inputs"}:
+        raise ValidationError(
+            "output regeneration requires exactly available, capability_id, source_refs, recipe_digest, and exact_inputs"
+        )
+    available = value["available"]
+    if not isinstance(available, bool):
+        raise ValidationError("output regeneration.available must be a boolean")
+    capability_id = value["capability_id"]
+    if capability_id is not None and (not isinstance(capability_id, str) or not capability_id):
+        raise ValidationError("output regeneration.capability_id must be a non-empty string or null")
+    if available and capability_id is None:
+        raise ValidationError("available regeneration requires capability_id")
+    source_refs = value["source_refs"]
+    if not isinstance(source_refs, list) or any(
+        not isinstance(reference, str) or not OBJECT_ID_RE.fullmatch(reference) or not reference.startswith("sha256:")
+        for reference in source_refs
+    ):
+        raise ValidationError("output regeneration.source_refs must contain canonical sha256 object IDs")
+    recipe_digest = value["recipe_digest"]
+    if not isinstance(recipe_digest, str) or not OBJECT_ID_RE.fullmatch(recipe_digest) or not recipe_digest.startswith("sha256:"):
+        raise ValidationError("output regeneration.recipe_digest must be a canonical sha256 digest")
+    exact_inputs = value["exact_inputs"]
+    if not isinstance(exact_inputs, (dict, list)):
+        raise ValidationError("output regeneration.exact_inputs must be an object or list")
+    if _contains_latest(exact_inputs):
+        raise ValidationError("output regeneration.exact_inputs must never use latest")
+    return value
 
 
 def validate_idempotency_key(value):
@@ -2274,6 +2394,89 @@ class RuntimeService:
         """Read Runtime-owned immutable output associations and lifecycle state."""
         return self.store.list_managed_outputs(task_id)
 
+    def managed_output_page(self, task_id):
+        """Return the public task-scoped managed-output collection."""
+        self.store.get_task(str(task_id))
+        return {"items": self.store.list_managed_outputs(task_id), "next_cursor": None}
+
+    def managed_output(self, association_id):
+        """Read one named managed association without exposing CAS or SQLite."""
+        return self.store.get_managed_output(association_id)
+
+    @_durable_mutation
+    def adopt_managed_output(self, association_id, body=None, *, idempotency_key=None):
+        """Acknowledge/adopt an existing immutable association by managed name.
+
+        Adoption never creates a second association or resolves a filesystem
+        path. Optional identity fields are equality assertions against the
+        Runtime-owned association, making a changed payload a conflict while
+        preserving the durable receipt for an exact retry.
+        """
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = {} if body is None else _wire_object(body, allowed=(
+            "association_id", "manifest_ref", "object_id", "digest", "size",
+            "filename", "media_type", "output_port", "selector", "ordinal",
+            "role", "durability",
+        ))
+        association = self.store.get_managed_output(association_id)
+        if body.get("association_id") is not None and str(body["association_id"]) != str(association_id):
+            raise ConflictError("association_id does not match the managed-output path")
+        for field in (
+            "manifest_ref", "object_id", "digest", "size", "filename", "media_type",
+            "output_port", "selector", "ordinal", "role", "durability",
+        ):
+            if field in body and body[field] != association.get(field):
+                raise ConflictError("managed-output adoption identity does not match", details={"field": field})
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        project_id = association.get("project_id") or "unscoped"
+        replay = self._command_replay("managed_output.adopt", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        return self._command_record(
+            "managed_output.adopt", str(association_id), idempotency_key, request_hash,
+            association, project_id=project_id,
+        )
+
+    @_durable_mutation
+    def update_managed_output_lifecycle(self, association_id, body, *, idempotency_key=None):
+        """Mutate only Runtime lifecycle state for one immutable association."""
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = _wire_object(
+            body,
+            required=("operation", "expected_version"),
+            allowed=("operation", "expected_version", "lease_id", "lease_owner", "lease_seconds", "provenance"),
+        )
+        operation = _wire_string(body, "operation")
+        _wire_integer(body, "expected_version", positive=True)
+        if "lease_id" in body and (not isinstance(body["lease_id"], str) or not body["lease_id"]):
+            raise ValidationError("lease_id must be a non-empty string")
+        if "lease_owner" in body and (not isinstance(body["lease_owner"], str) or not body["lease_owner"]):
+            raise ValidationError("lease_owner must be a non-empty string")
+        if "lease_seconds" in body and (
+            isinstance(body["lease_seconds"], bool) or not isinstance(body["lease_seconds"], int)
+            or body["lease_seconds"] <= 0
+        ):
+            raise ValidationError("lease_seconds must be a positive integer")
+        if "provenance" in body and not isinstance(body["provenance"], dict):
+            raise ValidationError("lifecycle provenance must be an object")
+        association = self.store.get_managed_output(association_id)
+        project_id = association.get("project_id") or "unscoped"
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        replay = self._command_replay("managed_output.lifecycle", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        result = self.store.update_managed_output_lifecycle(
+            association_id, operation, expected_version=body["expected_version"],
+            lease_id=body.get("lease_id"), lease_owner=body.get("lease_owner"),
+            lease_seconds=body.get("lease_seconds"),
+        )
+        if "provenance" in body:
+            result["lifecycle_provenance"] = dict(body["provenance"])
+        return self._command_record(
+            "managed_output.lifecycle", str(association_id), idempotency_key, request_hash,
+            result, project_id=project_id,
+        )
+
     def run(self, run_id):
         row = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if not row:
@@ -2812,7 +3015,7 @@ class RuntimeService:
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
                 allowed = {
-                    "name", "filename", "output_port", "group_key", "variant_key", "generation_id",
+                    "name", "filename", "output_port", "selector", "group_key", "variant_key", "generation_id",
                     "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role",
                     "is_primary", "duration_seconds", "durability", "producer", "provenance",
                     "regeneration", "coverage",
@@ -2920,6 +3123,14 @@ class RuntimeService:
                 output_port = output.get("output_port", name)
                 if not isinstance(output_port, str) or not output_port or len(output_port) > 255 or any(ord(char) < 32 for char in output_port):
                     raise ValidationError("output_port is invalid")
+                selector = output.get("selector")
+                if selector is not None:
+                    if not isinstance(selector, dict) or set(selector) != {"group_key", "variant_key"}:
+                        raise ValidationError("output selector requires exactly group_key and variant_key")
+                    if "group_key" not in output:
+                        output["group_key"] = selector["group_key"]
+                    if "variant_key" not in output:
+                        output["variant_key"] = selector["variant_key"]
                 group_key = output.get("group_key", "default")
                 if not isinstance(group_key, str) or not group_key or len(group_key) > 255 or any(ord(char) < 32 for char in group_key):
                     raise ValidationError("output group_key is invalid")
@@ -2939,14 +3150,11 @@ class RuntimeService:
                 if not isinstance(producer, dict) or not isinstance(provenance, dict):
                     raise ValidationError("output producer and provenance must be objects")
                 regeneration = output.get("regeneration")
-                if regeneration is not None and not isinstance(regeneration, dict):
-                    raise ValidationError("output regeneration must be an object")
+                if regeneration is not None:
+                    regeneration = _validate_regeneration(regeneration)
                 coverage = output.get("coverage")
                 if coverage is not None:
-                    if isinstance(coverage, str):
-                        coverage = {"kind": coverage}
-                    if not isinstance(coverage, dict) or coverage.get("kind") not in MANAGED_COVERAGE_KINDS:
-                        raise ValidationError("output coverage kind is invalid")
+                    coverage = _validate_coverage(coverage)
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
@@ -2967,6 +3175,8 @@ class RuntimeService:
                     normalized["filename"] = filename
                 if "output_port" in output:
                     normalized["output_port"] = output_port
+                if selector is not None:
+                    normalized["selector"] = {"group_key": group_key, "variant_key": variant_key}
                 if "group_key" in output:
                     normalized["group_key"] = group_key
                 if "variant_key" in output:

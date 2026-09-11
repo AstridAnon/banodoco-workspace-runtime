@@ -276,7 +276,8 @@ CREATE TABLE managed_output_lifecycle (
     association_id TEXT PRIMARY KEY REFERENCES managed_output_associations(association_id) ON DELETE CASCADE,
     state TEXT NOT NULL CHECK (state IN ('available', 'temporary', 'expired', 'promoted', 'reclaimed')),
     version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
-    expires_at TEXT, pinned_at TEXT, updated_at TEXT NOT NULL, created_at TEXT NOT NULL
+    expires_at TEXT, pinned_at TEXT, lease_id TEXT, lease_owner TEXT,
+    lease_expires_at TEXT, updated_at TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX idx_attempts_recovery_nonce ON attempts(recovery_nonce) WHERE recovery_nonce IS NOT NULL;
 CREATE INDEX idx_events_run ON events(run_id, id);
