@@ -10,14 +10,25 @@ from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def _new_service(root: Path, **kwargs):
+    RealmStore.initialize(root).close()
+    return RuntimeService(root, **kwargs)
+
+
+def _new_daemon(root: Path, **kwargs):
+    RealmStore.initialize(root).close()
+    return RuntimeDaemon(root, **kwargs)
+
+
 def _service_attempt(tmp_path: Path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     definition = _digest(b"render-settlement-v1")
     service.register_capability({"capability_id": "render.settlement", "definition_digest": definition})
     service.register_executor(
@@ -43,7 +54,7 @@ def _service_attempt(tmp_path: Path):
 
 
 def test_two_worker_credentials_cannot_cross_claim_or_mutate_attempt(tmp_path: Path) -> None:
-    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    daemon = _new_daemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         owner = Api(daemon.endpoint, daemon.token)
         capability = "render.security"
@@ -80,7 +91,7 @@ def test_two_worker_credentials_cannot_cross_claim_or_mutate_attempt(tmp_path: P
 
 
 def test_settlement_stages_all_outputs_before_fenced_publication(tmp_path: Path) -> None:
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         definition = _digest(b"render-settlement-v1")
         service.register_capability({"capability_id": "render.settlement", "definition_digest": definition})
@@ -181,7 +192,7 @@ def test_stale_fence_rejects_output_before_any_staging_or_publication(tmp_path: 
 
 
 def test_attempt_staging_rejects_path_escape_ids(tmp_path: Path) -> None:
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         with pytest.raises(ValidationError, match="attempt_id is invalid"):
             service._stage_outputs("../outside", [])
@@ -257,7 +268,7 @@ def test_journal_recovery_pins_cas_prefix_before_unlinking(tmp_path: Path) -> No
     root = tmp_path / "realm"
     payload = b"journal-recovery"
     digest = _digest(payload).removeprefix("sha256:")
-    service = RuntimeService(root)
+    service = _new_service(root)
     service._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
     service.cas.put(payload)
     destination = service.cas.path_for(digest)

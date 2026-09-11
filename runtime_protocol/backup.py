@@ -603,7 +603,9 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                     os.close(obj_dir)
             write_bytes_at(temporary_fd, "cas-manifest.json", (canonical_json(cas) + "\n").encode())
             realm = store.realm
-            schema_version = store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            schema_version = store.conn.execute(
+                "SELECT version FROM runtime_schema WHERE id=1"
+            ).fetchone()[0]
             auth_path = absolute_path(key_path or (store.root / ".operator-backup-key"))
             auth_key = bytes(key) if key is not None else _provision_key(auth_path)
             if len(auth_key) < 32:
@@ -786,7 +788,10 @@ def structured_export(store) -> dict:
     shot_items = rows("SELECT * FROM shot_items ORDER BY shot_id, sort_key, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
     text_bindings = rows("SELECT * FROM shot_text_bindings ORDER BY project_id, id")
     text_binding_events = rows("SELECT * FROM shot_text_binding_events ORDER BY project_id, binding_id, seq", lambda value: value | {"payload": json.loads(value.pop("payload_json"))})
-    owner_records = rows("SELECT source_table, source_key, source_ordinal, row_json, row_sha256, created_at FROM migration_owner_records ORDER BY source_table, source_ordinal, source_key")
+    # Canonical fresh realms deliberately contain no migration-owner ledger.
+    # Keep the export key stable for callers while leaving legacy import data
+    # outside the fresh-format foundation boundary.
+    owner_records = []
     for record in owner_records:
         record["row"] = json.loads(record.pop("row_json"))
     return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events, "migration_owner_records": owner_records}

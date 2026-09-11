@@ -32,6 +32,8 @@ REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
+MANAGED_COVERAGE_KINDS = frozenset({"full", "range", "members", "sampled"})
+MANAGED_DURABILITIES = frozenset({"durable", "temporary"})
 TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
 TEXT_BINDING_MAX_BYTES = 1_048_576
 TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -229,7 +231,11 @@ class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None):
-        self.store = RealmStore(root, strict_admission=True)
+        root_path = Path(root).expanduser().resolve()
+        # Service startup is an open/admission operation.  Realm creation is
+        # explicit through RealmStore.initialize; a missing path must fail
+        # before schema, identity, lock, or storage roots can be created.
+        self.store = RealmStore(root_path, strict_admission=True)
         self._verified = False
         self._admission_failure = None
         try:
@@ -1902,6 +1908,9 @@ class RuntimeService:
 
     @_durable_mutation
     def create_generation(self, project_id, body, *, idempotency_key=None):
+        raise ConflictError(
+            "direct generation publication is disabled; use an admitted GEN D1 settlement effect"
+        )
         self._require_object_body(body)
         project = self.store.get_project(project_id)
         generation_id = str(body.get("generation_id") or "")
@@ -1943,6 +1952,9 @@ class RuntimeService:
 
     @_durable_mutation
     def create_variant(self, generation_id, body, *, idempotency_key=None):
+        raise ConflictError(
+            "direct variant publication is disabled; use an admitted GEN D1 settlement effect"
+        )
         self._require_object_body(body)
         generation = self.get_generation(generation_id)
         variant_id = str(body.get("variant_id") or "")
@@ -2225,6 +2237,10 @@ class RuntimeService:
 
     def task(self, task_id):
         return self.store.get_task(task_id)
+
+    def managed_outputs(self, task_id):
+        """Read Runtime-owned immutable output associations and lifecycle state."""
+        return self.store.list_managed_outputs(task_id)
 
     def run(self, run_id):
         row = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -2763,7 +2779,12 @@ class RuntimeService:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
-                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary", "duration_seconds"}
+                allowed = {
+                    "name", "filename", "output_port", "group_key", "variant_key", "generation_id",
+                    "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role",
+                    "is_primary", "duration_seconds", "durability", "producer", "provenance",
+                    "regeneration", "coverage",
+                }
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
@@ -2782,6 +2803,9 @@ class RuntimeService:
                 name = output.get("name", "output")
                 if not isinstance(name, str) or not name or len(name) > 512:
                     raise ValidationError("output name must be a non-empty string")
+                filename = output.get("filename", name)
+                if not isinstance(filename, str) or not filename or len(filename) > 512 or any(ord(char) < 32 for char in filename):
+                    raise ValidationError("output filename is invalid")
                 media_type = output.get("media_type", "application/octet-stream")
                 if not isinstance(media_type, str) or not media_type or len(media_type) > 255 or any(ord(char) < 32 for char in media_type):
                     raise ValidationError("output media_type is invalid")
@@ -2861,6 +2885,36 @@ class RuntimeService:
                     or float(duration_seconds) <= 0
                 ):
                     raise ValidationError("output duration_seconds must be a positive finite number")
+                output_port = output.get("output_port", name)
+                if not isinstance(output_port, str) or not output_port or len(output_port) > 255 or any(ord(char) < 32 for char in output_port):
+                    raise ValidationError("output_port is invalid")
+                group_key = output.get("group_key", "default")
+                if not isinstance(group_key, str) or not group_key or len(group_key) > 255 or any(ord(char) < 32 for char in group_key):
+                    raise ValidationError("output group_key is invalid")
+                variant_key = output.get("variant_key", str(ordinal if ordinal is not None else 0))
+                if not isinstance(variant_key, str) or len(variant_key) > 255 or any(ord(char) < 32 for char in variant_key):
+                    raise ValidationError("output variant_key is invalid")
+                generation_id = output.get("generation_id")
+                if generation_id is not None and (not isinstance(generation_id, str) or not generation_id or len(generation_id) > 255):
+                    raise ValidationError("output generation_id is invalid")
+                durability = output.get("durability", "durable")
+                if durability not in MANAGED_DURABILITIES:
+                    raise ValidationError("output durability is invalid")
+                if durability == "temporary" and is_primary is True:
+                    raise ValidationError("primary outputs must be durable")
+                producer = output.get("producer", {})
+                provenance = output.get("provenance", {})
+                if not isinstance(producer, dict) or not isinstance(provenance, dict):
+                    raise ValidationError("output producer and provenance must be objects")
+                regeneration = output.get("regeneration")
+                if regeneration is not None and not isinstance(regeneration, dict):
+                    raise ValidationError("output regeneration must be an object")
+                coverage = output.get("coverage")
+                if coverage is not None:
+                    if isinstance(coverage, str):
+                        coverage = {"kind": coverage}
+                    if not isinstance(coverage, dict) or coverage.get("kind") not in MANAGED_COVERAGE_KINDS:
+                        raise ValidationError("output coverage kind is invalid")
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
@@ -2869,7 +2923,24 @@ class RuntimeService:
                         raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
-                normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
+                normalized = {
+                    "name": name, "kind": kind, "digest": digest_value,
+                    "media_type": media_type, "size": size,
+                }
+                # Keep the established settlement result wire stable.  The
+                # association table/readback carries the defaulted filename,
+                # port, group, and variant identity; echo an extended field
+                # only when the producer explicitly supplied it.
+                if "filename" in output:
+                    normalized["filename"] = filename
+                if "output_port" in output:
+                    normalized["output_port"] = output_port
+                if "group_key" in output:
+                    normalized["group_key"] = group_key
+                if "variant_key" in output:
+                    normalized["variant_key"] = variant_key
+                if generation_id is not None:
+                    normalized["generation_id"] = generation_id
                 if ordinal is not None:
                     normalized["ordinal"] = ordinal
                 if role is not None:
@@ -2878,7 +2949,23 @@ class RuntimeService:
                     normalized["is_primary"] = is_primary
                 if duration_seconds is not None:
                     normalized["duration_seconds"] = duration_seconds
-                staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
+                if durability != "durable":
+                    normalized["durability"] = durability
+                if producer:
+                    normalized["producer"] = producer
+                if provenance:
+                    normalized["provenance"] = provenance
+                if regeneration is not None:
+                    normalized["regeneration"] = regeneration
+                if coverage is not None:
+                    normalized["coverage"] = coverage
+                staged.append({
+                    "digest": digest, "path": stage_path, "size": size, "media_type": media_type,
+                    "name": name, "filename": filename, "output": normalized,
+                    "output_port": output_port, "group_key": group_key, "variant_key": variant_key,
+                    "generation_id": generation_id, "durability": durability, "producer": producer,
+                    "provenance": provenance, "regeneration": regeneration, "coverage": coverage,
+                })
             return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
             self._discard_staged_outputs({"stage_dir": stage_dir, "items": staged})

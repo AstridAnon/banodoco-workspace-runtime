@@ -7,10 +7,16 @@ import pytest
 
 from runtime_protocol.errors import ConflictError, ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _new_service(root):
+    RealmStore.initialize(root).close()
+    return RuntimeService(root)
 
 
 def _attempt(service: RuntimeService):
@@ -26,7 +32,7 @@ def _attempt(service: RuntimeService):
 
 
 def test_executor_identity_is_migrated_persisted_and_reregistration_is_idempotent(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         digest = _digest(b"executor-source")
         body = {
@@ -57,7 +63,7 @@ def test_executor_identity_is_migrated_persisted_and_reregistration_is_idempoten
 
 
 def test_settlement_persists_flat_result_and_rejects_reserved_outputs(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         _task, attempt = _attempt(service)
         payload = b"identity-output"
@@ -83,7 +89,7 @@ def test_settlement_persists_flat_result_and_rejects_reserved_outputs(tmp_path):
 
 
 def test_settlement_preserves_output_descriptors(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         task, attempt = _attempt(service)
         payload = b"descriptor-output"

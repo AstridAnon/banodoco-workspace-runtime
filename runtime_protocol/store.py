@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
+from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .util import canonical_json, new_id, now
 
 try:
@@ -37,13 +38,12 @@ FACT_EXACT_KEYS = frozenset({
     "custom_node_digest", "driver", "root", "port",
 })
 FACT_MINIMUM_KEYS = frozenset({"vram_bytes", "scratch_bytes"})
-# Admission checks the complete current schema shape after any upgrade has run
-# against the isolated snapshot.  Keeping this contract explicit prevents a
-# current-version database with a missing runtime column from being opened and
-# then partially mutated before the first query discovers the damage.
+# Admission checks the complete canonical shape against an isolated snapshot.
+# This list is intentionally independent of the historical migration files:
+# an existing database must already have this shape and is never upgraded on
+# open or verify.
 REQUIRED_SCHEMA_COLUMNS = {
     "attempts": frozenset("id task_id lease_id fence executor_id lease_expires_at settled runtime_epoch recovery_nonce recovery_nonce_expires_at recovery_nonce_used".split()),
-    "canonical_receipt_backfills": frozenset("id source_schema_version backfilled_count completed_at".split()),
     "capabilities": frozenset("id definition_digest status required_resource_keys_json estimated_scratch_bytes estimated_output_bytes unavailable_reason created_at updated_at".split()),
     "command_idempotency": frozenset("command_kind aggregate_id idempotency_key request_hash result_json created_at txn_id primary_stream_id resulting_stream_seq first_project_seq last_project_seq event_ids_json".split()),
     "continuation_admissions": frozenset("continuation_task_id dependency_snapshot_json admitted_at".split()),
@@ -53,9 +53,8 @@ REQUIRED_SCHEMA_COLUMNS = {
     "generations": frozenset("id project_id source_task_id type status metadata_json version created_at updated_at".split()),
     "media_references": frozenset("id reference_id media_id role ordinal is_primary metadata_json created_at".split()),
     "media_relations": frozenset("project_id from_digest to_digest kind ordinal metadata_json created_at".split()),
-    "migration_event_streams": frozenset("source_stream_id destination_stream_id project_id stream_type aggregate_id head_seq source_ordinal source_created_at created_at".split()),
-    "migration_events": frozenset("source_event_id destination_event_id source_stream_id destination_stream_id project_id project_seq seq source_ordinal subject_type subject_id changes_json kind schema_version idempotency_key txn_id actor_kind payload_json source_created_at created_at".split()),
-    "migration_owner_records": frozenset("source_table source_key source_ordinal row_json row_sha256 created_at".split()),
+    "managed_output_associations": frozenset("association_id task_id attempt_id project_id output_port group_key generation_id variant_key object_digest manifest_digest size filename media_type ordinal role producer_json provenance_json durability regeneration_json coverage_json created_at".split()),
+    "managed_output_lifecycle": frozenset("association_id state version expires_at pinned_at updated_at created_at".split()),
     "objects": frozenset("digest size media_type original_name created_at".split()),
     "project_documents": frozenset("id project_id kind content_json version created_at updated_at".split()),
     "project_objects": frozenset("project_id digest relation created_at".split()),
@@ -71,7 +70,6 @@ REQUIRED_SCHEMA_COLUMNS = {
     "reservations": frozenset("task_id resource_key lease_token created_at released_at executor_id fence lease_expires_at runtime_epoch".split()),
     "runs": frozenset("id project_id capability spec_json status idempotency_key created_at updated_at".split()),
     "runtime_lifecycle": frozenset("id runtime_epoch boot_id previous_boot_id started_at recovered_task_count".split()),
-    "schema_migrations": frozenset("version applied_at".split()),
     "shot_items": frozenset("id shot_id media_id sort_key source_frame metadata_json created_at".split()),
     "shot_text_binding_events": frozenset("event_id binding_id project_id seq kind payload_json previous_hash event_hash created_at".split()),
     "shot_text_bindings": frozenset("id project_id shot_id kind slot media_digest event_stream_id head_seq created_at updated_at".split()),
@@ -85,12 +83,13 @@ REQUIRED_SCHEMA_COLUMNS = {
     "timeline_shot_state": frozenset("id version archived_at".split()),
     "timeline_shots": frozenset("id timeline_id start_ms duration_ms reference_ids_json".split()),
     "timelines": frozenset("id project_id version created_at archived_at".split()),
+    "runtime_schema": frozenset("id format_id version created_at".split()),
 }
 REQUIRED_SCHEMA_TABLES = frozenset(REQUIRED_SCHEMA_COLUMNS)
-_REALM_METADATA_TABLES = frozenset({
-    "schema_migrations", "canonical_receipt_backfills", "realm_lifecycle",
-    "runtime_lifecycle", "migration_event_streams", "migration_events",
-    "migration_owner_records",
+_REALM_METADATA_TABLES = frozenset({"runtime_schema", "realm_lifecycle", "runtime_lifecycle"})
+_LEGACY_SCHEMA_TABLES = frozenset({
+    "schema_migrations", "canonical_receipt_backfills", "migration_event_streams",
+    "migration_events", "migration_owner_records", "workers",
 })
 
 
@@ -154,11 +153,65 @@ class RealmStore:
     process lock and a SQLite transaction.
     """
 
-    def __init__(self, root: str | Path, *, create: bool = True, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, strict_admission: bool = False):
+    @classmethod
+    def initialize(cls, root: str | Path, *, display_name: str = "Workspace", realm_id: str | None = None):
+        """Explicitly create and verify one fresh canonical realm.
+
+        Normal open never creates a root, schema, identity, lock directory, or
+        CAS directory.  Creation is a separate operation so a missing path is
+        an admission failure rather than an implicit bootstrap.
+        """
+        root = Path(root).expanduser().resolve()
+        if root.exists():
+            if root.is_symlink() or not root.is_dir():
+                raise RealmAdmissionError("fresh realm root is not a directory")
+            if any(root.iterdir()):
+                raise RealmAdmissionError("fresh realm root must be absent or empty")
+        else:
+            root.mkdir(parents=True, exist_ok=False)
+            root.chmod(0o700)
+        store = cls.__new__(cls)
+        store.root = root
+        store.lock_path = root / "owner.lock"
+        store.db_path = root / "realm.sqlite3"
+        store.cas_root = root / "cas" / "sha256"
+        store.staging_root = root / "staging"
+        store._lock_file = None
+        store._mutex = threading.RLock()
+        store.conn = None
+        try:
+            store._acquire_owner()
+            store._open(fresh=True)
+            timestamp = now()
+            rid = str(realm_id or new_id())
+            if not rid.strip() or not isinstance(display_name, str) or not display_name.strip():
+                raise ValidationError("fresh realm identity is invalid")
+            with store._transaction():
+                store.conn.execute(
+                    "INSERT INTO realm(id, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (rid, display_name, timestamp, timestamp),
+                )
+                store.conn.execute(
+                    "INSERT INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)",
+                    (rid,),
+                )
+            store.admission_report = store.integrity_report()
+            if not store.admission_report.get("ok"):
+                raise RealmAdmissionError("fresh realm failed canonical admission", details=store.admission_report)
+            return store
+        except Exception:
+            store.close()
+            raise
+
+    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, strict_admission: bool = False):
         self.root = Path(root).expanduser().resolve()
         if create:
-            self.root.mkdir(parents=True, exist_ok=True)
-            self.root.chmod(0o700)
+            raise ValidationError("implicit realm creation is disabled; use RealmStore.initialize")
+        if self.root.is_symlink() or not self.root.exists() or not self.root.is_dir():
+            raise RealmAdmissionError(
+                "realm root is missing or is not a directory",
+                details=self._integrity_failure("missing_root", "realm root does not exist or is not a directory"),
+            )
         self.lock_path = self.root / "owner.lock"
         self.db_path = self.root / "realm.sqlite3"
         self.cas_root = self.root / "cas" / "sha256"
@@ -166,33 +219,30 @@ class RealmStore:
         self._lock_file = None
         self._mutex = threading.RLock()
         self.conn = None
-        if acquire_owner:
-            self._acquire_owner()
         try:
             sqlite_components = [
                 self.db_path,
                 *(Path(str(self.db_path) + suffix) for suffix in ("-wal", "-shm", "-journal")),
             ]
-            if acquire_owner and any(path.exists() or path.is_symlink() for path in sqlite_components):
+            if not any(path.exists() or path.is_symlink() for path in sqlite_components):
+                self.admission_report = self._integrity_failure("missing_database", "realm.sqlite3 is missing")
+                raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            # Inspect before creating owner.lock so malformed or unsupported
+            # roots fail without changing their source tree.  Reinspect under
+            # the lock to close the race with a concurrent writer.
+            self.admission_report = self.inspect_realm(
+                self.root, timeout_seconds=admission_timeout, allow_migration=False,
+            )
+            if not self.admission_report.get("ok"):
+                raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            if acquire_owner:
+                self._acquire_owner()
                 self.admission_report = self.inspect_realm(
-                    self.root,
-                    timeout_seconds=admission_timeout,
-                    allow_migration=True,
+                    self.root, timeout_seconds=admission_timeout, allow_migration=False,
                 )
-                # A low-level store is also used to finish migrations for
-                # legacy schema-only databases. It may open an otherwise
-                # readable identity-only legacy state so the migration can
-                # complete. RuntimeService opts into strict admission and
-                # rejects that state before _open or _migrate can touch it.
-                identity_only_legacy = set(self.admission_report.get("issues", [])) == {"realm_identity"}
-                if not self.admission_report.get("ok") and (strict_admission or not identity_only_legacy):
-                    raise RealmAdmissionError(
-                        "realm failed startup admission",
-                        details=self.admission_report,
-                    )
-            else:
-                self.admission_report = {"state": "uninitialized", "ok": True}
-            self._open()
+                if not self.admission_report.get("ok"):
+                    raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            self._open(fresh=False)
         except Exception:
             self.close()
             raise
@@ -226,8 +276,10 @@ class RealmStore:
             self.conn.commit()
 
     def _acquire_owner(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock_path.parent.chmod(0o700)
+        if not self.root.exists() or not self.root.is_dir() or self.root.is_symlink():
+            raise RealmAdmissionError("realm root is unavailable before owner admission")
+        if self.lock_path.is_symlink():
+            raise RealmAdmissionError("owner lock must not be a symlink")
         self._lock_file = open(self.lock_path, "a+")
         self.lock_path.chmod(0o600)
         if fcntl is not None:
@@ -317,43 +369,6 @@ class RealmStore:
                 inspector.conn = connection
                 inspector._mutex = threading.RLock()
                 try:
-                    if allow_migration:
-                        migration_tables = {
-                            str(row[0])
-                            for row in connection.execute(
-                                "SELECT name FROM sqlite_master WHERE type='table'"
-                            )
-                        }
-                        migration_version = 0
-                        if "schema_migrations" in migration_tables:
-                            row = connection.execute(
-                                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-                            ).fetchone()
-                            migration_version = int(row[0] or 0)
-                        if not 1 <= migration_version <= SCHEMA_VERSION:
-                            connection.execute("PRAGMA query_only=ON")
-                            return inspector.integrity_report(
-                                catalog_path=catalog_path,
-                                timeout_seconds=max(0.001, deadline - time.monotonic()),
-                                allow_migration=False,
-                            )
-                        migration_timed_out = False
-
-                        def migration_progress():
-                            nonlocal migration_timed_out
-                            migration_timed_out = time.monotonic() >= deadline
-                            return 1 if migration_timed_out else 0
-
-                        connection.set_progress_handler(migration_progress, 1000)
-                        try:
-                            connection.execute("PRAGMA foreign_keys=ON")
-                            inspector._migrate()
-                        except sqlite3.DatabaseError as exc:
-                            if migration_timed_out:
-                                raise TimeoutError("realm inspection timed out") from exc
-                            raise
-                        finally:
-                            connection.set_progress_handler(None, 0)
                     connection.execute("PRAGMA query_only=ON")
                     return inspector.integrity_report(
                         catalog_path=catalog_path,
@@ -392,23 +407,38 @@ class RealmStore:
             },
         }
 
-    def _open(self):
-        self.root.mkdir(parents=True, exist_ok=True)
+    def _open(self, *, fresh=False):
+        if not self.root.exists() or not self.root.is_dir():
+            raise RealmAdmissionError("realm root is unavailable")
         if any(path.is_symlink() for path in (self.cas_root.parent, self.cas_root, self.staging_root)):
             raise ValidationError("runtime storage roots must not be symlinks")
-        self.cas_root.parent.mkdir(parents=True, exist_ok=True)
-        self.cas_root.mkdir(parents=True, exist_ok=True)
-        self.cas_root.parent.chmod(0o700)
-        self.cas_root.chmod(0o700)
-        self.staging_root.mkdir(parents=True, exist_ok=True)
-        self.staging_root.chmod(0o700)
-        self.conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None, check_same_thread=False)
+        if fresh:
+            self.cas_root.parent.mkdir(parents=True, exist_ok=False)
+            self.cas_root.mkdir(parents=True, exist_ok=False)
+            self.cas_root.parent.chmod(0o700)
+            self.cas_root.chmod(0o700)
+            self.staging_root.mkdir(parents=True, exist_ok=False)
+            self.staging_root.chmod(0o700)
+            self.conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None, check_same_thread=False)
+        else:
+            for path in (self.cas_root.parent, self.cas_root, self.staging_root):
+                if not path.exists() or not path.is_dir():
+                    raise RealmAdmissionError("realm storage roots are incomplete")
+            self.conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=rw", uri=True, timeout=10,
+                isolation_level=None, check_same_thread=False,
+            )
         self.db_path.chmod(0o600)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        if fresh:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.executescript(CANONICAL_SCHEMA_SQL)
+            self.conn.execute(
+                "INSERT INTO runtime_schema(id, format_id, version, created_at) VALUES (1, ?, ?, ?)",
+                (CANONICAL_FORMAT_ID, SCHEMA_VERSION, now()),
+            )
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=10000")
-        self._migrate()
 
     def attempt_staging_dir(self, attempt_id):
         """Return the private staging directory for one persisted attempt."""
@@ -780,11 +810,16 @@ class RealmStore:
         with self._mutex:
             row = self.realm
             if row:
+                if realm_id is not None and str(realm_id) != row["id"]:
+                    raise ConflictError(
+                        "requested realm identity does not match the admitted realm",
+                        details={"expected": row["id"], "actual": str(realm_id)},
+                    )
                 return row
-            rid, timestamp = realm_id or new_id(), now()
-            self.conn.execute("INSERT INTO realm VALUES (?, ?, ?, ?)", (rid, display_name, timestamp, timestamp))
-            self.conn.execute("INSERT OR IGNORE INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)", (rid,))
-            return dict(self.conn.execute("SELECT * FROM realm WHERE id=?", (rid,)).fetchone())
+            raise RealmAdmissionError(
+                "realm identity is missing; implicit identity creation is disabled",
+                details={"reason": "realm_identity_missing"},
+            )
 
     def realm_lifecycle(self):
         row = self.conn.execute("SELECT * FROM realm_lifecycle WHERE realm_id=?", (self.realm["id"],)).fetchone()
@@ -2188,6 +2223,131 @@ class RealmStore:
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
 
+    def _validated_manifest_digest(self, result, *, project_id=None):
+        """Validate an optional managed-manifest reference before publication."""
+        reference = result.get("manifest_ref") if isinstance(result, dict) else None
+        if reference is None:
+            return None
+        if not isinstance(reference, dict):
+            raise ValidationError("manifest_ref must be an object")
+        unknown = set(reference) - {"object_id", "digest", "size"}
+        if unknown:
+            raise ValidationError("manifest_ref contains unsupported fields", details={"fields": sorted(unknown)})
+        object_id = reference.get("object_id", reference.get("digest"))
+        if not isinstance(object_id, str) or not OBJECT_ID_RE.fullmatch(object_id) or not object_id.startswith("sha256:"):
+            raise ValidationError("manifest_ref requires a canonical sha256 object_id")
+        digest = object_id.removeprefix("sha256:")
+        size = reference.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValidationError("manifest_ref size must be a non-negative integer")
+        matching_output = next(
+            (output for output in result.get("outputs", [])
+             if isinstance(output, dict) and output.get("digest") == object_id),
+            None,
+        )
+        if matching_output is not None:
+            if int(matching_output["size"]) != size:
+                raise ConflictError("manifest_ref size does not match settled output")
+        else:
+            row = self.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+            if not row or int(row["size"]) != size:
+                raise ConflictError("manifest_ref is not a verified managed object")
+            if project_id and not self.conn.execute(
+                "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+                (project_id, digest),
+            ).fetchone():
+                raise ConflictError("manifest_ref is outside the task project")
+        return digest
+
+    def _managed_output_value(self, row):
+        value = dict(row)
+        for field in ("producer_json", "provenance_json", "regeneration_json", "coverage_json"):
+            value[field.removesuffix("_json")] = json.loads(value[field]) if value[field] is not None else None
+            value.pop(field)
+        value["object_id"] = "sha256:" + value.pop("object_digest")
+        if value.get("manifest_digest"):
+            value["manifest_ref"] = "sha256:" + value.pop("manifest_digest")
+        return value
+
+    def _associate_managed_outputs(self, result, *, task_id, attempt_id, project_id, applied_effect=None):
+        """Persist immutable output identity and initial Runtime lifecycle atomically."""
+        manifest_digest = self._validated_manifest_digest(result, project_id=project_id)
+        if manifest_digest is None:
+            manifest_output = next(
+                (output for output in result.get("outputs", [])
+                 if isinstance(output, dict) and output.get("role") == "manifest"),
+                None,
+            )
+            if manifest_output is not None:
+                manifest_digest = str(manifest_output["digest"]).removeprefix("sha256:")
+        associations = []
+        for output in result.get("outputs", []):
+            if not isinstance(output, dict) or output.get("kind") != "object":
+                continue
+            digest = str(output["digest"]).removeprefix("sha256:")
+            output_port = output.get("output_port", output.get("name", "output"))
+            group_key = output.get("group_key", "default")
+            variant_key = output.get("variant_key", str(output.get("ordinal", 0)))
+            generation_id = output.get("generation_id")
+            if generation_id is None and isinstance(applied_effect, dict):
+                generation_id = applied_effect.get("generation_id")
+            ordinal = int(output.get("ordinal", 0))
+            role = output.get("role") or "output"
+            durability = output.get("durability", "durable")
+            producer = output.get("producer") or {}
+            provenance = dict(output.get("provenance") or {})
+            provenance.setdefault("task_id", str(task_id))
+            provenance.setdefault("attempt_id", str(attempt_id))
+            provenance.setdefault("runtime_epoch", self._current_runtime_epoch())
+            identity = {
+                "task_id": str(task_id), "output_port": output_port,
+                "group_key": group_key, "generation_id": generation_id,
+                "variant_key": variant_key, "ordinal": ordinal,
+            }
+            association_id = "managed-output-" + hashlib.sha256(
+                canonical_json(identity).encode()
+            ).hexdigest()
+            self.conn.execute(
+                "INSERT OR IGNORE INTO managed_output_associations("
+                "association_id, task_id, attempt_id, project_id, output_port, group_key, "
+                "generation_id, variant_key, object_digest, manifest_digest, size, filename, "
+                "media_type, ordinal, role, producer_json, provenance_json, durability, "
+                "regeneration_json, coverage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    association_id, str(task_id), str(attempt_id), project_id, output_port,
+                    group_key, generation_id, variant_key, digest, manifest_digest,
+                    int(output["size"]), output.get("filename", output.get("name", "output")),
+                    output.get("media_type", "application/octet-stream"), ordinal, role,
+                    canonical_json(producer), canonical_json(provenance), durability,
+                    canonical_json(output["regeneration"]) if output.get("regeneration") is not None else None,
+                    canonical_json(output["coverage"]) if output.get("coverage") is not None else None,
+                    now(),
+                ),
+            )
+            lifecycle_state = "temporary" if durability == "temporary" else "available"
+            self.conn.execute(
+                "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, ?, ?)",
+                (association_id, lifecycle_state, now(), now()),
+            )
+            row = self.conn.execute(
+                "SELECT a.*, l.state, l.version, l.expires_at, l.pinned_at, l.updated_at AS lifecycle_updated_at "
+                "FROM managed_output_associations a JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+                "WHERE a.association_id=?",
+                (association_id,),
+            ).fetchone()
+            associations.append(self._managed_output_value(row))
+        return associations
+
+    def list_managed_outputs(self, task_id):
+        with self._mutex:
+            rows = self.conn.execute(
+                "SELECT a.*, l.state, l.version, l.expires_at, l.pinned_at, l.updated_at AS lifecycle_updated_at "
+                "FROM managed_output_associations a JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+                "WHERE a.task_id=? ORDER BY a.created_at, a.association_id",
+                (str(task_id),),
+            ).fetchall()
+            return [self._managed_output_value(row) for row in rows]
+
     def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -2224,6 +2384,7 @@ class RealmStore:
                         result=result,
                         input_object_ids=input_object_ids,
                     )
+                self._validated_manifest_digest(result, project_id=task_project_id)
                 applied_effect = None
                 append_effect = effect is not None and effect.get("effect_type") in {
                     "generation.variant.append",
@@ -2249,6 +2410,13 @@ class RealmStore:
                     publish()
                 if applied_effect is not None:
                     result["generation_variant"] = applied_effect
+                managed_outputs = self._associate_managed_outputs(
+                    result,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    project_id=task_project_id,
+                    applied_effect=applied_effect,
+                )
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
@@ -2466,21 +2634,38 @@ class RealmStore:
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing_tables = sorted(REQUIRED_SCHEMA_TABLES - actual_tables)
         missing_columns = {}
+        extra_columns = {}
         for table, required in REQUIRED_SCHEMA_COLUMNS.items():
             if table in actual_tables:
-                missing = sorted(required - self._table_columns(table))
+                actual_columns = self._table_columns(table)
+                missing = sorted(required - actual_columns)
+                extra = sorted(actual_columns - required)
                 if missing:
                     missing_columns[table] = missing
+                if extra:
+                    extra_columns[table] = extra
         actual_schema = None
-        if "schema_migrations" in actual_tables:
-            schema_row = self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()
-            actual_schema = int(schema_row[0] or 0)
-        schema_compatible = (
-            actual_schema is not None
-            and 1 <= actual_schema <= SCHEMA_VERSION
-            and {"realm", "schema_migrations"}.issubset(actual_tables)
+        actual_format = None
+        if "runtime_schema" in actual_tables:
+            schema_row = self.conn.execute(
+                "SELECT format_id, version FROM runtime_schema WHERE id=1"
+            ).fetchone()
+            if schema_row:
+                actual_format = schema_row["format_id"]
+                actual_schema = int(schema_row["version"])
+        unexpected_tables = sorted(
+            table for table in actual_tables
+            if not str(table).startswith("sqlite_") and table not in REQUIRED_SCHEMA_TABLES
         )
-        schema_ok = schema_compatible if allow_migration else actual_schema == SCHEMA_VERSION and not missing_tables and not missing_columns
+        legacy_tables = sorted(set(unexpected_tables) & _LEGACY_SCHEMA_TABLES)
+        schema_ok = (
+            actual_schema == SCHEMA_VERSION
+            and actual_format == CANONICAL_FORMAT_ID
+            and not missing_tables
+            and not missing_columns
+            and not extra_columns
+            and not unexpected_tables
+        )
         realm_identity = {"ok": False, "realm_id": None, "row_count": None, "reason": "realm_table_missing"}
         if "realm" in actual_tables:
             realm_rows = self.conn.execute("SELECT id FROM realm LIMIT 2").fetchall()
@@ -2495,40 +2680,29 @@ class RealmStore:
                     realm_identity = {"ok": True, "realm_id": realm_id, "row_count": 1, "reason": None}
                 else:
                     realm_identity["reason"] = "realm_identity_invalid"
-        # A freshly created schema is intentionally identity-free until the
-        # service performs its first initialization.  Preserve that narrow
-        # bootstrap state, but never treat a previously-used realm as valid
-        # without exactly one identity.  Lifecycle rows or any durable domain
-        # content make an identity-less realm an admission failure.
         uninitialized = False
-        if not realm_identity["ok"] and realm_identity["reason"] == "realm_identity_missing":
-            lifecycle_tables_empty = all(
-                not self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                for table in ("realm_lifecycle", "runtime_lifecycle")
-                if table in actual_tables
-            )
-            content_tables_empty = all(
-                not self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                for table in sorted(REQUIRED_SCHEMA_TABLES - _REALM_METADATA_TABLES - {"realm"})
-                if table in actual_tables
-            )
-            uninitialized = lifecycle_tables_empty and content_tables_empty
-            if uninitialized:
-                realm_identity = {"ok": True, "realm_id": None, "row_count": 0, "reason": "uninitialized"}
-        objects = self.conn.execute("SELECT digest FROM objects").fetchall() if "objects" in actual_tables else []
+        objects = self.conn.execute("SELECT digest, size FROM objects").fetchall() if "objects" in actual_tables else []
         reachable = {str(row[0]) for row in objects}
         missing = []
         corrupt = []
-        for digest in sorted(reachable):
+        for object_row in objects:
+            digest = str(object_row["digest"])
             try:
                 actual = self._cas_digest(digest, deadline=deadline)
+                actual_size = self._cas_size(digest)
             except TimeoutError:
                 raise
             except OSError:
                 missing.append(digest)
                 continue
-            if actual != digest:
-                corrupt.append({"digest": digest, "actual_sha256": actual})
+            if actual != digest or actual_size != int(object_row["size"]):
+                corrupt.append({
+                    "digest": digest,
+                    "reason": "digest_mismatch" if actual != digest else "size_mismatch",
+                    "actual_sha256": actual,
+                    "expected_size": int(object_row["size"]),
+                    "actual_size": actual_size,
+                })
         orphaned = self._cas_orphans(reachable, deadline=deadline)
         cas_ok = not missing and not corrupt
         event_errors = []
@@ -2542,6 +2716,45 @@ class RealmStore:
                     if expected != event["event_hash"]:
                         event_errors.append({"run_id": run[0], "event_id": event["id"], "reason": "hash_mismatch"})
                     previous = event["event_hash"]
+        relational_errors = []
+        if realm_identity["ok"] and {"realm", "realm_lifecycle"}.issubset(actual_tables):
+            lifecycle_rows = self.conn.execute(
+                "SELECT realm_id, state FROM realm_lifecycle"
+            ).fetchall()
+            if len(lifecycle_rows) != 1 or lifecycle_rows[0]["realm_id"] != realm_identity["realm_id"]:
+                relational_errors.append({"table": "realm_lifecycle", "reason": "realm_lifecycle_identity"})
+        if {"managed_output_associations", "managed_output_lifecycle", "objects", "attempts", "tasks"}.issubset(actual_tables):
+            association_rows = self.conn.execute("SELECT * FROM managed_output_associations").fetchall()
+            for association in association_rows:
+                object_row = self.conn.execute(
+                    "SELECT size, media_type FROM objects WHERE digest=?",
+                    (association["object_digest"],),
+                ).fetchone()
+                if not object_row or int(object_row["size"]) != int(association["size"]) or object_row["media_type"] != association["media_type"]:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "object_metadata"})
+                attempt = self.conn.execute(
+                    "SELECT task_id FROM attempts WHERE id=?", (association["attempt_id"],)
+                ).fetchone()
+                if not attempt or attempt["task_id"] != association["task_id"]:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "attempt_task_identity"})
+                if association["manifest_digest"] is not None and not self.conn.execute(
+                    "SELECT 1 FROM objects WHERE digest=?", (association["manifest_digest"],)
+                ).fetchone():
+                    relational_errors.append({"association_id": association["association_id"], "reason": "manifest_object_missing"})
+                lifecycle_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM managed_output_lifecycle WHERE association_id=?",
+                    (association["association_id"],),
+                ).fetchone()[0]
+                if lifecycle_count != 1:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "lifecycle_missing"})
+        if {"managed_output_associations", "managed_output_lifecycle"}.issubset(actual_tables):
+            orphan_lifecycle = self.conn.execute(
+                "SELECT association_id FROM managed_output_lifecycle WHERE association_id NOT IN (SELECT association_id FROM managed_output_associations)"
+            ).fetchall()
+            relational_errors.extend(
+                {"association_id": row["association_id"], "reason": "lifecycle_orphan"}
+                for row in orphan_lifecycle
+            )
         sqlite_ok = quick == "ok"
         catalog_check = {"status": "not_configured", "ok": True, "issues": []}
         activation_check = {"status": "not_configured", "ok": True, "issues": []}
@@ -2552,7 +2765,7 @@ class RealmStore:
             catalog_check = {"status": "blocked", "ok": False, "issues": ["catalog_realm_unavailable"], "path": str(catalog_path)}
             activation_check = {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
         identity_ok = realm_identity["ok"]
-        healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and catalog_check["ok"] and activation_check["ok"]
+        healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and catalog_check["ok"] and activation_check["ok"]
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")
@@ -2561,6 +2774,7 @@ class RealmStore:
         if missing: issues.append("reachable_cas")
         if corrupt: issues.append("corrupt_cas")
         if event_errors: issues.append("event_chain")
+        if relational_errors: issues.append("relational")
         issues.extend(catalog_check.get("issues", [])); issues.extend(activation_check.get("issues", []))
         recovery = "No recovery action required." if healthy else "Restore the realm from a verified backup, then re-run doctor."
         if (catalog_check["ok"] is False or activation_check["ok"] is False) and sqlite_ok and not fk and schema_ok and identity_ok and cas_ok:
@@ -2575,12 +2789,24 @@ class RealmStore:
                 "sqlite_quick_check": quick,
                 "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
-                "schema": {"ok": schema_ok, "expected_version": SCHEMA_VERSION, "actual_version": actual_schema, "missing_tables": missing_tables, "missing_columns": missing_columns},
+                "schema": {
+                    "ok": schema_ok,
+                    "expected_format_id": CANONICAL_FORMAT_ID,
+                    "actual_format_id": actual_format,
+                    "expected_version": SCHEMA_VERSION,
+                    "actual_version": actual_schema,
+                    "missing_tables": missing_tables,
+                    "missing_columns": missing_columns,
+                    "extra_columns": extra_columns,
+                    "unexpected_tables": unexpected_tables,
+                    "legacy_tables": legacy_tables,
+                },
                 "realm_identity": realm_identity,
                 "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},
                 "cas_missing": missing,
                 "event_chain": {"ok": not bool(event_errors), "errors": event_errors},
                 "event_chain_errors": event_errors,
+                "relational": {"ok": not bool(relational_errors), "errors": relational_errors},
                 "catalog": catalog_check,
                 "activation": activation_check,
                 "catalog_activation": {"ok": catalog_check["ok"] and activation_check["ok"], "catalog": catalog_check, "activation": activation_check},
@@ -2631,6 +2857,36 @@ class RealmStore:
                 if not block:
                     return digest_value.hexdigest()
                 digest_value.update(block)
+
+    def _cas_size(self, digest):
+        """Read the verified CAS entry size without following a link."""
+        cas_root_fd = getattr(self, "_cas_root_fd", None)
+        if cas_root_fd is not None:
+            if cas_root_fd < 0:
+                raise FileNotFoundError(digest)
+            prefix_fd = os.open(
+                digest[:2],
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=cas_root_fd,
+            )
+            try:
+                fd = os.open(digest[2:], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=prefix_fd)
+            finally:
+                os.close(prefix_fd)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("CAS entry is not a regular file")
+                return int(metadata.st_size)
+            finally:
+                os.close(fd)
+        path = self.cas_root / digest[:2] / digest[2:]
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(digest)
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("CAS entry is not a regular file")
+        return int(metadata.st_size)
 
     def _cas_orphans(self, reachable, *, deadline=None):
         cas_root_fd = getattr(self, "_cas_root_fd", None)
