@@ -1,9 +1,32 @@
-from migration_boundary import (
-    AuthorizationError,
-    BoundaryError as RuntimeErrorBase,
-    ConflictError,
-    ValidationError,
-)
+class RuntimeErrorBase(Exception):
+    code = "runtime_error"
+    status = 400
+
+    def __init__(self, message: str, *, details=None):
+        super().__init__(message)
+        self.message = message
+        self.details = details
+
+    def as_dict(self):
+        result = {"code": self.code, "message": self.message}
+        if self.details is not None:
+            result["details"] = self.details
+        return result
+
+
+class AuthorizationError(RuntimeErrorBase):
+    code = "unauthorized"
+    status = 401
+
+
+class ConflictError(RuntimeErrorBase):
+    code = "conflict"
+    status = 409
+
+
+class ValidationError(RuntimeErrorBase):
+    code = "validation_error"
+    status = 422
 
 
 class ForbiddenError(RuntimeErrorBase):
