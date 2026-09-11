@@ -2681,8 +2681,8 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
-        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
-        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
+        registered = self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
+        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": registered["capabilities"], "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
         if verified_facts is not None:
             result["verified_facts"] = verified_facts
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
