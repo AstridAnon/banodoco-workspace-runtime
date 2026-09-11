@@ -33,6 +33,8 @@ OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 # JSON clients (including TypeScript) must be able to preserve the exact byte
 # count used in the admission hash.  Stay within IEEE-754's safe integer range.
 MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
+GENERATION_INTENT_STORAGE_KEY = "__runtime_generation_intent"
+LEGACY_GENERATION_INTENT_STORAGE_KEY = "generation_intent"
 FACT_EXACT_KEYS = frozenset({
     "interpreter", "runtime_lock", "engine_lock", "model_digest",
     "custom_node_digest", "driver", "root", "port",
@@ -128,6 +130,33 @@ def normalize_execution_facts(value, *, field="execution facts"):
             raise ValidationError(f"{field}.minimum.{key} is out of range")
         normalized_minimum[key] = fact
     return {"exact": normalized_exact, "minimum": normalized_minimum}
+
+
+def public_task_spec(spec):
+    """Split internal generation intent from the public task spec."""
+    public = dict(spec or {})
+    intent = public.pop(GENERATION_INTENT_STORAGE_KEY, None)
+    if intent is None and LEGACY_GENERATION_INTENT_STORAGE_KEY in public:
+        intent = public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY)
+    else:
+        public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY, None)
+    return public, intent
+
+
+def canonical_task_spec_for_compare(spec):
+    """Canonicalize legacy/current intent storage for idempotency comparison."""
+    public, intent = public_task_spec(spec)
+    if intent is not None:
+        public[GENERATION_INTENT_STORAGE_KEY] = intent
+    return public
+
+
+def task_spec_for_request_hash(spec):
+    """Keep the pre-fix request hash stable across the storage-key change."""
+    public, intent = public_task_spec(spec)
+    if intent is not None:
+        public[LEGACY_GENERATION_INTENT_STORAGE_KEY] = intent
+    return public
 
 
 def execution_facts_match(required, verified):
@@ -870,7 +899,7 @@ class RealmStore:
                     if receipt:
                         if receipt["request_hash"] != request_hash:
                             raise ConflictError("idempotency key was already used with different input")
-                        return json.loads(receipt["result_json"])
+                        return self._public_task_result(json.loads(receipt["result_json"]))
                     prior = self.conn.execute("SELECT * FROM projects WHERE realm_id=? AND idempotency_key=?", (realm["id"], idempotency_key)).fetchone()
                     if prior:
                         if prior["slug"] != slug or prior["name"] != name or json.loads(prior["metadata_json"]) != (metadata or {}):
@@ -1107,7 +1136,7 @@ class RealmStore:
             project_id = self._project(project)["id"] if project else None
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
-                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": spec, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
                 aggregate_id = project_id or "unscoped"
                 if idempotency_key:
                     receipt = self.conn.execute(
@@ -1121,7 +1150,8 @@ class RealmStore:
                 if idempotency_key:
                     old = self.conn.execute("SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?", (project_id, idempotency_key)).fetchone()
                     if old:
-                        if old["spec_json"] != canonical_json(spec) or old["capability"] != capability:
+                        old_spec = json.loads(old["spec_json"])
+                        if canonical_task_spec_for_compare(old_spec) != canonical_task_spec_for_compare(spec) or old["capability"] != capability:
                             raise ConflictError("idempotency key was already used with different input")
                         task = self.conn.execute("SELECT * FROM tasks WHERE run_id=?", (old["id"],)).fetchone()
                         result = self._task_result(old, task)
@@ -1378,11 +1408,11 @@ class RealmStore:
 
     def _task_result(self, run, task):
         result = dict(task)
-        result["spec"] = json.loads(result.pop("spec_json"))
-        if "generation_intent" in result["spec"]:
+        result["spec"], generation_intent = public_task_spec(json.loads(result.pop("spec_json")))
+        if generation_intent is not None:
             # The producer intent is part of the immutable admission payload;
             # expose the same opaque value on canonical task readback.
-            result["generation_intent"] = result["spec"]["generation_intent"]
+            result["generation_intent"] = generation_intent
         if "required_facts" in result["spec"]:
             result["required_facts"] = dict(result["spec"]["required_facts"])
         if result.get("expected_effect_json"):
@@ -1393,7 +1423,23 @@ class RealmStore:
             result["result"] = json.loads(result["result_json"])
         if result.get("waiting_reason"):
             result["blocked_reason"] = result["waiting_reason"]
-        return {"run": dict(run), "task": result}
+        return self._public_task_result({"run": dict(run), "task": result})
+
+    def _public_task_result(self, value):
+        """Remove internal/legacy intent keys from a stored task result."""
+        result = dict(value)
+        task = result.get("task")
+        if isinstance(task, dict):
+            task = dict(task)
+            task["spec"], generation_intent = public_task_spec(task.get("spec") or {})
+            if generation_intent is None and task.get("generation_intent") is not None:
+                generation_intent = task["generation_intent"]
+            if generation_intent is None:
+                task.pop("generation_intent", None)
+            else:
+                task["generation_intent"] = generation_intent
+            result["task"] = task
+        return result
 
     def get_task(self, task_id):
         row = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
