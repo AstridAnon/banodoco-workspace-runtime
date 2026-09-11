@@ -1983,13 +1983,13 @@ class RealmStore:
             )
         if isinstance(payload["version"], bool) or payload["version"] != 1:
             raise ValidationError("generation.publish_v1 payload.version must be 1")
-        if payload["modality"] not in {"image", "video", "audio"}:
+        if not isinstance(payload["modality"], str) or payload["modality"] not in {"image", "video", "audio"}:
             raise ValidationError("generation.publish_v1 payload.modality is invalid")
         if not isinstance(payload["generation_type"], str) or not payload["generation_type"] or len(payload["generation_type"]) > 128:
             raise ValidationError("generation.publish_v1 generation_type must be a non-empty string of at most 128 characters")
         if not isinstance(payload["metadata"], dict):
             raise ValidationError("generation.publish_v1 metadata must be an object")
-        if payload["partial_success_policy"] not in {"reject", "allow"}:
+        if not isinstance(payload["partial_success_policy"], str) or payload["partial_success_policy"] not in {"reject", "allow"}:
             raise ValidationError("generation.publish_v1 partial_success_policy is invalid")
         groups = payload["groups"]
         if not isinstance(groups, list) or not groups:
@@ -2011,6 +2011,7 @@ class RealmStore:
             if not isinstance(selectors, list) or not selectors:
                 raise ValidationError("generation.publish_v1 selectors must be a non-empty list")
             group_declarations = []
+            seen_group_variants = set()
             for selector in selectors:
                 if not isinstance(selector, dict) or set(selector) != {"selector", "ordinal", "variant_key", "output_port"}:
                     raise ValidationError(
@@ -2032,6 +2033,10 @@ class RealmStore:
                 if key in seen_selectors:
                     raise ValidationError("generation.publish_v1 selectors must not contain duplicates")
                 seen_selectors.add(key)
+                group_variant = (ordinal, variant_key)
+                if group_variant in seen_group_variants:
+                    raise ValidationError("generation.publish_v1 group selectors must not duplicate ordinal and variant_key")
+                seen_group_variants.add(group_variant)
                 declaration = {
                     "selector": label,
                     "ordinal": ordinal,
@@ -2393,6 +2398,7 @@ class RealmStore:
                     association_overrides[key] = {
                         "generation_id": generation_id,
                         "variant_id": variant_id,
+                        "selector": declaration["selector"],
                     }
                     variants.append({
                         "variant_id": variant_id,
@@ -2652,17 +2658,25 @@ class RealmStore:
             ordinal = int(output.get("ordinal", 0))
             publish_key = (output_port, group_key, variant_key, ordinal)
             if isinstance(applied_effect, dict) and applied_effect.get("effect_type") == "generation.publish_v1":
-                generation_id = (publish_overrides.get(publish_key) or {}).get("generation_id")
+                publish_override = publish_overrides.get(publish_key) or {}
+                generation_id = publish_override.get("generation_id")
             elif isinstance(applied_effect, dict):
+                publish_override = {}
                 generation_id = applied_effect.get("generation_id")
             else:
                 # Producer-supplied generation IDs are never authoritative;
                 # generic managed outputs stay outside the generation domain.
+                publish_override = {}
                 generation_id = None
             role = output.get("role") or "output"
             durability = output.get("durability", "durable")
             producer = dict(output.get("producer") or {})
             provenance = dict(output.get("provenance") or {})
+            if publish_override.get("selector") is not None:
+                # The managed association schema already has an extensible
+                # provenance object; retain GEN's selector label there rather
+                # than adding a second association column.
+                provenance["selector"] = publish_override["selector"]
             task_row = self.conn.execute("SELECT capability FROM tasks WHERE id=?", (str(task_id),)).fetchone()
             attempt_row = self.conn.execute(
                 "SELECT executor_id, fence, runtime_epoch FROM attempts WHERE id=?",
