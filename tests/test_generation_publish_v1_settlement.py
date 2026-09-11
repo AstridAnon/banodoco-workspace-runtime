@@ -155,10 +155,14 @@ def test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity(tmp_
 
         associations = service.managed_outputs(task_id)
         selected = {(item["output_port"], item["group_key"], item["variant_key"], item["ordinal"]): item for item in associations}
-        assert selected[("video", "main", "first", 0)]["generation_id"] == _derived_generation(task_id, "main")
+        first = selected[("video", "main", "first", 0)]
+        assert first["generation_id"] == _derived_generation(task_id, "main")
+        assert first["provenance"]["selector"] == "first"
         assert selected[("video", "main", "second", 1)]["generation_id"] == _derived_generation(task_id, "main")
         assert selected[("audio", "audio", "original", 0)]["generation_id"] == _derived_generation(task_id, "audio")
-        assert selected[("thumbnail", "other", "preview", 0)]["generation_id"] is None
+        extra = selected[("thumbnail", "other", "preview", 0)]
+        assert extra["generation_id"] is None
+        assert "selector" not in extra["provenance"]
     finally:
         service.close()
 
@@ -225,14 +229,28 @@ def test_publish_v1_rejects_wrong_shape_duplicates_and_project_target_at_admissi
     try:
         project = service.create_project({"slug": "shape", "name": "Shape"}, idempotency_key="shape-project")
         base = _effect(project["id"])
-        for bad in (
+        for index, bad in enumerate((
             {**base, "extra": True},
             {**base, "payload": {**base["payload"], "groups": [{"group_key": "main", "selectors": []}]}},
             {**base, "payload": {**base["payload"], "modality": "text"}},
-        ):
+            {**base, "payload": {**base["payload"], "modality": []}},
+            {**base, "payload": {**base["payload"], "partial_success_policy": {}}},
+        )):
             with pytest.raises(ValidationError):
-                service.create_task({"capability_id": CAPABILITY, "project": project["id"], "settlement_effect": bad, "idempotency_key": "shape-" + str(len(bad))})
+                service.create_task({"capability_id": CAPABILITY, "project": project["id"], "settlement_effect": bad, "idempotency_key": "shape-" + str(index)})
         duplicate = _effect(
+            project["id"],
+            groups=[{
+                "group_key": "main",
+                "selectors": [
+                    {"selector": "one", "ordinal": 0, "variant_key": "same", "output_port": "video"},
+                    {"selector": "two", "ordinal": 0, "variant_key": "same", "output_port": "audio"},
+                ],
+            }],
+        )
+        with pytest.raises(ValidationError, match="ordinal and variant_key"):
+            service.create_task({"capability_id": CAPABILITY, "project": project["id"], "settlement_effect": duplicate, "idempotency_key": "shape-duplicate"})
+        full_duplicate = _effect(
             project["id"],
             groups=[{
                 "group_key": "main",
@@ -243,7 +261,7 @@ def test_publish_v1_rejects_wrong_shape_duplicates_and_project_target_at_admissi
             }],
         )
         with pytest.raises(ValidationError, match="must not contain duplicates"):
-            service.create_task({"capability_id": CAPABILITY, "project": project["id"], "settlement_effect": duplicate, "idempotency_key": "shape-duplicate"})
+            service.create_task({"capability_id": CAPABILITY, "project": project["id"], "settlement_effect": full_duplicate, "idempotency_key": "shape-full-duplicate"})
         foreign_project = service.create_project({"slug": "foreign", "name": "Foreign"}, idempotency_key="shape-foreign-project")
         foreign = _effect(foreign_project["id"])
         with pytest.raises(ConflictError, match="target project does not match"):
