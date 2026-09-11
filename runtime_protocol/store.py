@@ -1379,6 +1379,10 @@ class RealmStore:
     def _task_result(self, run, task):
         result = dict(task)
         result["spec"] = json.loads(result.pop("spec_json"))
+        if "generation_intent" in result["spec"]:
+            # The producer intent is part of the immutable admission payload;
+            # expose the same opaque value on canonical task readback.
+            result["generation_intent"] = result["spec"]["generation_intent"]
         if "required_facts" in result["spec"]:
             result["required_facts"] = dict(result["spec"]["required_facts"])
         if result.get("expected_effect_json"):

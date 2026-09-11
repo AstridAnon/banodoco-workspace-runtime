@@ -64,6 +64,7 @@ def test_reboot_requeues_durable_task_and_fences_old_process(tmp_path):
 
 def test_reboot_recovery_is_atomic_with_settlement_effects(tmp_path):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     first = RuntimeService(root)
     project = first.create_project({"slug": "effect", "name": "Before"})
     effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1, "payload": {"name": "After"}}
@@ -106,6 +107,7 @@ def test_stale_settlement_rejects_before_cas_or_object_mutation(tmp_path):
 
 def test_checkpoint_reboot_resume_is_nonce_bound_and_test_injected(tmp_path):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     invoked = []
 
     def injected_executor(command, checkpoint):
@@ -167,8 +169,10 @@ def test_reboot_request_claim_is_atomic_under_forced_race(tmp_path):
 
 def test_generated_python_prepare_reboot_binds_path_attempt_id_on_live_daemon(tmp_path):
     invoked = []
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     daemon = __import__("runtime_protocol.daemon", fromlist=["RuntimeDaemon"]).RuntimeDaemon(
-        tmp_path / "realm", reboot_executor=lambda command, checkpoint: invoked.append((command, checkpoint)) or {"ok": True}
+        root, reboot_executor=lambda command, checkpoint: invoked.append((command, checkpoint)) or {"ok": True}
     ).start()
     try:
         owner = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -206,7 +210,9 @@ def test_stale_or_omitted_worker_epoch_has_no_descriptor_side_effects(tmp_path):
 
 
 def test_recovery_authorization_is_durable_one_shot_and_forgery_resistant(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     service.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
     service.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "auth"})
     attempt = service.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": service.health()["runtime_epoch"]})
@@ -225,6 +231,7 @@ def test_recovery_authorization_is_durable_one_shot_and_forgery_resistant(tmp_pa
 
 def test_resume_verifies_exact_bytes_and_never_claims_another_task(tmp_path):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     first = RuntimeService(root, reboot_executor=lambda *_: {"injected": True})
     first.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
     first.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "exact"})
@@ -248,6 +255,7 @@ def test_resume_verifies_exact_bytes_and_never_claims_another_task(tmp_path):
 
 def test_stale_client_must_supply_runtime_epoch_after_reboot(tmp_path):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     first = RuntimeService(root)
     first.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
     first.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "epoch"})
