@@ -1597,7 +1597,26 @@ class RealmStore:
                 elif verified_facts != candidate:
                     raise ValidationError("executor capability facts are inconsistent")
                 value = {key: fact for key, fact in value.items() if key != "verified_facts"}
-            capabilities.append(value)
+            capability_id = value if isinstance(value, str) else value.get("capability_id", value.get("id"))
+            if not isinstance(capability_id, str) or not capability_id:
+                raise ValidationError("executor capability must identify a capability")
+            capability = self.conn.execute(
+                "SELECT id, definition_digest, status, required_resource_keys_json, "
+                "estimated_scratch_bytes, estimated_output_bytes, unavailable_reason "
+                "FROM capabilities WHERE id=?",
+                (capability_id,),
+            ).fetchone()
+            if not capability:
+                raise ValidationError("executor capability is not registered")
+            capabilities.append({
+                "capability_id": capability["id"],
+                "definition_digest": capability["definition_digest"],
+                "status": capability["status"],
+                "required_resource_keys": json.loads(capability["required_resource_keys_json"]),
+                "estimated_scratch_bytes": capability["estimated_scratch_bytes"],
+                "estimated_output_bytes": capability["estimated_output_bytes"],
+                "unavailable_reason": capability["unavailable_reason"],
+            })
         result["capabilities"] = capabilities
         result["resource_keys"] = json.loads(result.pop("resource_keys_json"))
         result.setdefault("readiness", "ready")
