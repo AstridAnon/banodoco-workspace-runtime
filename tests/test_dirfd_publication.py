@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import threading
 
@@ -10,16 +9,14 @@ import runtime_protocol.backup as backup_module
 from runtime_protocol.dirfd import atomic_json_write
 from runtime_protocol.dirfd import capture_parent, close_pinned
 from runtime_protocol.catalog import RealmCatalog
-import tools.astrid_migrate.migrator as migrator_module
-import tools.astrid_migrate.rehearsal as rehearsal_module
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.errors import ConflictError
-from tools.astrid_migrate import MigrationConfig, MigrationError, build_synthetic_fixture
-from tools.astrid_migrate.boundary import RealmCatalog as MigrationRealmCatalog
-from tools.astrid_migrate.boundary import capture_parent as migration_capture_parent
-from tools.astrid_migrate.boundary import close_pinned as migration_close_pinned
-from tools.astrid_migrate.recovery import RecoveryJournal
-from tools.astrid_migrate.rehearsal import MigrationJournal
+from runtime_protocol.store import RealmStore
+
+
+def _service(root, **kwargs):
+    RealmStore.initialize(root).close()
+    return RuntimeService(root, **kwargs)
 
 
 def _swap_on_final_rename(monkeypatch, module, parent: Path, outside: Path, target_name: str, *, mode: str):
@@ -44,14 +41,14 @@ def _swap_on_final_rename(monkeypatch, module, parent: Path, outside: Path, targ
 
 @pytest.mark.parametrize("mode", ["symlink", "replacement"])
 def test_runtime_backup_last_rename_is_parent_pinned(tmp_path, monkeypatch, mode):
-    active = RuntimeService(tmp_path / "active")
+    active = _service(tmp_path / "active")
     parent = tmp_path / "backup-parent"
     parent.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     state = _swap_on_final_rename(monkeypatch, backup_module, parent, outside, "backup", mode=mode)
     try:
-        with pytest.raises((ConflictError, MigrationError), match="identity|symlink|parent"):
+        with pytest.raises(ConflictError, match="identity|symlink|parent"):
             active.backup(parent / "backup")
         swapped, real_parent = state()
         assert swapped and (real_parent / "backup").is_dir()
@@ -63,7 +60,7 @@ def test_runtime_backup_last_rename_is_parent_pinned(tmp_path, monkeypatch, mode
 
 @pytest.mark.parametrize("mode", ["symlink", "replacement"])
 def test_runtime_restore_last_rename_is_parent_pinned(tmp_path, monkeypatch, mode):
-    active = RuntimeService(tmp_path / "active")
+    active = _service(tmp_path / "active")
     backup = tmp_path / "backup"
     active.backup(backup)
     parent = tmp_path / "restore-parent"
@@ -72,7 +69,7 @@ def test_runtime_restore_last_rename_is_parent_pinned(tmp_path, monkeypatch, mod
     outside.mkdir()
     state = _swap_on_final_rename(monkeypatch, backup_module, parent, outside, "candidate", mode=mode)
     try:
-        with pytest.raises((ConflictError, MigrationError), match="identity|symlink|parent"):
+        with pytest.raises(ConflictError, match="identity|symlink|parent"):
             active.restore(backup, parent / "candidate")
         swapped, real_parent = state()
         assert swapped and (real_parent / "candidate").is_dir()
@@ -80,42 +77,6 @@ def test_runtime_restore_last_rename_is_parent_pinned(tmp_path, monkeypatch, mod
         assert active.health()["status"] == "ok"
     finally:
         active.close()
-
-
-def test_b10_archive_last_rename_is_parent_pinned(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    build_synthetic_fixture(source)
-    parent = tmp_path / "archive-parent"
-    parent.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    config = MigrationConfig(source, parent / "archive", tmp_path / "destination")
-    migrator = migrator_module.Migrator(config)
-    state = _swap_on_final_rename(monkeypatch, migrator_module, parent, outside, "archive", mode="replacement")
-    with pytest.raises((ConflictError, MigrationError), match="identity|symlink|parent"):
-        migrator._archive(migrator.inventory())
-    swapped, real_parent = state()
-    assert swapped and (real_parent / "archive").is_dir()
-    assert not any(outside.iterdir())
-
-
-@pytest.mark.parametrize("journal_factory", [MigrationJournal, RecoveryJournal])
-def test_lifecycle_journal_last_rename_is_parent_pinned(tmp_path, monkeypatch, journal_factory):
-    parent = tmp_path / "journal-parent"
-    parent.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    path = parent / "migration-journal.json"
-    journal = journal_factory(path)
-    state = _swap_on_final_rename(monkeypatch, rehearsal_module, parent, outside, path.name, mode="replacement")
-    try:
-        with pytest.raises((ConflictError, MigrationError), match="identity|symlink|parent"):
-            journal.bind(request="bound")
-        swapped, real_parent = state()
-        assert swapped and (real_parent / path.name).is_file()
-        assert not any(outside.iterdir())
-    finally:
-        del journal
 
 
 def test_atomic_publication_survives_concurrent_parent_swap_loop(tmp_path):
@@ -176,7 +137,7 @@ def test_atomic_publication_survives_concurrent_parent_swap_loop(tmp_path):
 
 
 def test_backup_verification_read_is_pinned_against_parent_replacement(tmp_path):
-    active = RuntimeService(tmp_path / "active")
+    active = _service(tmp_path / "active")
     backup = tmp_path / "backup"
     active.backup(backup)
     identity = capture_parent(backup)
@@ -197,35 +158,8 @@ def test_backup_verification_read_is_pinned_against_parent_replacement(tmp_path)
         active.close()
 
 
-def test_migration_catalog_publication_honors_retained_parent_identity(tmp_path):
-    support = tmp_path / "catalog-support"
-    support.mkdir()
-    catalog_path = support / "catalog.json"
-    catalog_path.write_text('{"format_version": 1, "realms": [], "selected_realm_id": null}\n', encoding="utf-8")
-    identity = migration_capture_parent(catalog_path)
-    replacement = tmp_path / "catalog-support-replacement"
-    try:
-        support.rename(replacement)
-        support.mkdir()
-        with pytest.raises((ConflictError, MigrationError), match="identity|parent"):
-            MigrationRealmCatalog(catalog_path).register(
-                realm_id="realm",
-                display_name="Realm",
-                data_root=str(tmp_path / "realm"),
-                path_identity=identity,
-            )
-        assert not (support / "catalog.json").exists()
-        assert not json.loads((replacement / "catalog.json").read_text(encoding="utf-8")).get("realms")
-    finally:
-        migration_close_pinned(identity)
-        if support.exists() and not any(support.iterdir()):
-            support.rmdir()
-        if replacement.exists():
-            replacement.rename(support)
-
-
 def test_backup_manifest_file_replacement_at_read_syscall_fails_closed(tmp_path, monkeypatch):
-    active = RuntimeService(tmp_path / "active")
+    active = _service(tmp_path / "active")
     backup = tmp_path / "backup"
     active.backup(backup)
     original_open = backup_module.os.open
@@ -245,25 +179,6 @@ def test_backup_manifest_file_replacement_at_read_syscall_fails_closed(tmp_path,
         assert replaced and active.health()["status"] == "ok"
     finally:
         active.close()
-
-
-@pytest.mark.parametrize("journal_factory", [MigrationJournal, RecoveryJournal])
-def test_journal_read_is_pinned_against_parent_replacement(tmp_path, journal_factory):
-    parent = tmp_path / "journal-parent"
-    parent.mkdir()
-    path = parent / "journal.json"
-    journal = journal_factory(path)
-    journal.bind(request="bound")
-    replacement = parent.with_name(parent.name + "-replacement")
-    parent.rename(replacement)
-    parent.mkdir()
-    try:
-        with pytest.raises((ConflictError, MigrationError), match="identity|parent|symlink|journal"):
-            journal.read() if isinstance(journal, RecoveryJournal) else journal._read()
-    finally:
-        del journal
-        parent.rmdir()
-        replacement.rename(parent)
 
 
 def test_catalog_read_rejects_ordinary_parent_replacement(tmp_path):

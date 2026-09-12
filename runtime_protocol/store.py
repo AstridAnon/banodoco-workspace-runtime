@@ -41,7 +41,8 @@ FACT_EXACT_KEYS = frozenset({
 })
 FACT_MINIMUM_KEYS = frozenset({"vram_bytes", "scratch_bytes"})
 # Admission checks the complete canonical shape against an isolated snapshot.
-# This list is intentionally independent of the historical migration files:
+# This list is the canonical contract and is intentionally independent of
+# any historical schema artifacts:
 # an existing database must already have this shape and is never upgraded on
 # open or verify.
 REQUIRED_SCHEMA_COLUMNS = {
@@ -89,10 +90,6 @@ REQUIRED_SCHEMA_COLUMNS = {
 }
 REQUIRED_SCHEMA_TABLES = frozenset(REQUIRED_SCHEMA_COLUMNS)
 _REALM_METADATA_TABLES = frozenset({"runtime_schema", "realm_lifecycle", "runtime_lifecycle"})
-_LEGACY_SCHEMA_TABLES = frozenset({
-    "schema_migrations", "canonical_receipt_backfills", "migration_event_streams",
-    "migration_events", "migration_owner_records", "workers",
-})
 
 
 def normalize_execution_facts(value, *, field="execution facts"):
@@ -232,7 +229,7 @@ class RealmStore:
             store.close()
             raise
 
-    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, strict_admission: bool = False):
+    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         self.root = Path(root).expanduser().resolve()
         if create:
             raise ValidationError("implicit realm creation is disabled; use RealmStore.initialize")
@@ -259,16 +256,12 @@ class RealmStore:
             # Inspect before creating owner.lock so malformed or unsupported
             # roots fail without changing their source tree.  Reinspect under
             # the lock to close the race with a concurrent writer.
-            self.admission_report = self.inspect_realm(
-                self.root, timeout_seconds=admission_timeout, allow_migration=False,
-            )
+            self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
             if not self.admission_report.get("ok"):
                 raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
             if acquire_owner:
                 self._acquire_owner()
-                self.admission_report = self.inspect_realm(
-                    self.root, timeout_seconds=admission_timeout, allow_migration=False,
-                )
+                self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
                 if not self.admission_report.get("ok"):
                     raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
             self._open(fresh=False)
@@ -340,7 +333,7 @@ class RealmStore:
             os.close(source_fd)
 
     @classmethod
-    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, allow_migration: bool = False):
+    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         """Inspect a WAL-aware isolated snapshot without opening the source DB.
 
         Startup calls this only after acquiring the realm owner lock, so the
@@ -402,7 +395,6 @@ class RealmStore:
                     return inspector.integrity_report(
                         catalog_path=catalog_path,
                         timeout_seconds=max(0.001, deadline - time.monotonic()),
-                        allow_migration=False,
                     )
                 finally:
                     connection.close()
@@ -480,187 +472,6 @@ class RealmStore:
         settlements_root.chmod(0o700)
         return settlements_root / attempt_id
 
-    def _migrate(self):
-        self.conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-        version = self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
-        if version > SCHEMA_VERSION:
-            raise ValidationError(f"database schema {version} is newer than runtime {SCHEMA_VERSION}")
-        # Some identity-free migration fixtures were assembled from the SQL
-        # files and therefore missed the schema-3 compatibility ALTER that is
-        # performed in code. Preserve that narrow low-level upgrade path, but
-        # never repair a database already claiming the current schema.
-        if 3 <= version < SCHEMA_VERSION and self._table_exists("tasks") and "attempt_id" not in self._table_columns("tasks"):
-            self.conn.execute("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
-        if version < 1:
-            self._run_migration(1)
-            version = 1
-        if version < 2:
-            # A short-lived convergence build created ``capabilities`` before
-            # this migration with seven columns. Upgrade that shape explicitly
-            # so old realms remain readable; the ALTER is part of migration 2,
-            # never a swallowed startup repair.
-            capability_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
-            if capability_columns:
-                missing = [column for column in ("created_at", "updated_at") if column not in capability_columns]
-                if missing:
-                    statements = ["BEGIN IMMEDIATE"]
-                    statements.extend(f"ALTER TABLE capabilities ADD COLUMN {column} TEXT" for column in missing)
-                    statements.append("COMMIT")
-                    self.conn.executescript(";\n".join(statements) + ";")
-            self._run_migration(2)
-            self.conn.execute("UPDATE capabilities SET created_at=COALESCE(created_at, ?), updated_at=COALESCE(updated_at, ?)", (now(), now()))
-            version = 2
-        if version < 3:
-            task_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(tasks)")}
-            statements = ["BEGIN IMMEDIATE"]
-            if "attempt_id" not in task_columns:
-                statements.append("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
-            statements.append((Path(__file__).parent / "migrations" / "003_domains.sql").read_text(encoding="utf-8"))
-            statements.append("INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))")
-            statements.append("COMMIT")
-            self.conn.executescript(";\n".join(statements) + ";")
-            version = 3
-        if version < 4:
-            self._run_migration(4)
-            version = 4
-        if version < 5:
-            self._run_migration(5)
-            version = 5
-        if version < 6:
-            self._run_migration(6)
-            version = 6
-        if version < 7:
-            self._run_migration(7)
-            version = 7
-        if version < 8:
-            self._run_migration(8)
-            version = 8
-        if version < 9:
-            self._run_migration(9)
-            version = 9
-        if version < 10:
-            self._run_migration(10)
-            version = 10
-        if version < 11:
-            self._run_migration(11)
-            version = 11
-        if version < 12:
-            self._run_migration(12)
-            version = 12
-        if version < 13:
-            self._run_migration(13)
-            version = 13
-        if version < 14:
-            self._run_migration(14)
-            version = 14
-        if version < 15:
-            self._run_migration(15)
-            version = 15
-        if version < 16:
-            self._run_migration(16)
-            version = 16
-        if version < 17:
-            self._run_receipt_backfill_migration()
-            version = 17
-        if version < 18:
-            self._run_migration(18)
-            version = 18
-        if version < 19:
-            self._run_migration(19)
-            version = 19
-        if version < 20:
-            self._run_migration(20)
-            version = 20
-        if version < 21:
-            self._run_executor_identity_migration()
-            version = 21
-        if version < 22:
-            self._run_migration(22)
-            version = 22
-        if version < 23:
-            self._run_migration(23)
-            version = 23
-
-    def _run_receipt_backfill_migration(self):
-        """Backfill pre-016 rows inside one retryable migration transaction."""
-        migration = Path(__file__).parent / "migrations" / "017_backfill_canonical_receipts.sql"
-        statements = [statement.strip() for statement in migration.read_text(encoding="utf-8").split(";") if statement.strip()]
-        with self._transaction():
-            for statement in statements:
-                self.conn.execute(statement)
-            rows = self.conn.execute(
-                "SELECT command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at "
-                "FROM command_idempotency WHERE txn_id IS NULL "
-                "ORDER BY created_at, command_kind, aggregate_id, idempotency_key"
-            ).fetchall()
-            # Existing post-016 rows, if any, already own canonical sequence
-            # numbers. Historical rows continue after those numbers.
-            next_seq = defaultdict(int)
-            for row in self.conn.execute(
-                "SELECT command_kind, aggregate_id, result_json, last_project_seq "
-                "FROM command_idempotency WHERE txn_id IS NOT NULL"
-            ):
-                existing_result = json.loads(row["result_json"])
-                existing_project = str(self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], existing_result) or "unscoped")
-                next_seq[existing_project] = max(next_seq[existing_project], int(row["last_project_seq"] or 0))
-            for row in rows:
-                result = json.loads(row["result_json"])
-                project_id = self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], result)
-                project_id = str(project_id or "unscoped")
-                next_seq[project_id] += 1
-                project_seq = next_seq[project_id]
-                event_ids, stream_id, stream_seq = self._legacy_receipt_events(row, result)
-                txn_material = {
-                    "command_kind": row["command_kind"],
-                    "aggregate_id": row["aggregate_id"],
-                    "idempotency_key": row["idempotency_key"],
-                    "request_hash": row["request_hash"],
-                    "created_at": row["created_at"],
-                }
-                txn_id = "txn-legacy-" + hashlib.sha256(canonical_json(txn_material).encode()).hexdigest()
-                self.conn.execute(
-                    "UPDATE command_idempotency SET txn_id=?, primary_stream_id=?, resulting_stream_seq=?, "
-                    "first_project_seq=?, last_project_seq=?, event_ids_json=? "
-                    "WHERE command_kind=? AND aggregate_id=? AND idempotency_key=? AND txn_id IS NULL",
-                    (txn_id, stream_id, stream_seq, project_seq, project_seq,
-                     canonical_json(event_ids), row["command_kind"], row["aggregate_id"], row["idempotency_key"]),
-                )
-            self.conn.execute(
-                "INSERT INTO canonical_receipt_backfills(id, source_schema_version, backfilled_count, completed_at) "
-                "VALUES (1, 16, ?, ?) ON CONFLICT(id) DO NOTHING",
-                (len(rows), now()),
-            )
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (17, datetime('now'))"
-            )
-
-    def _legacy_receipt_project(self, command_kind, aggregate_id, result):
-        """Resolve project identity from facts persisted before receipt fields."""
-        if command_kind == "project.create":
-            return result.get("id") or aggregate_id
-        if command_kind == "project.select":
-            return (result.get("project") or {}).get("id")
-        if command_kind in {"run.cancel", "run.retry"}:
-            row = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (aggregate_id,)).fetchone()
-            return row[0] if row and row[0] else "unscoped"
-        return result.get("project_id") or (result.get("project") or {}).get("id") or aggregate_id
-
-    def _legacy_receipt_events(self, row, result):
-        """Recover only event identities provably linked to the old result."""
-        if row["command_kind"] == "task.create":
-            run_id = (result.get("run") or {}).get("id")
-            events = self.conn.execute(
-                "SELECT id FROM events WHERE run_id=? AND kind='task.admitted' ORDER BY id",
-                (run_id,),
-            ).fetchall()
-            if len(events) != 1:
-                raise ValidationError(
-                    "historical task.create receipt requires exactly one committed task.admitted event"
-                )
-            count = self.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
-            return [str(events[0][0])], str(run_id), int(count)
-        return [], None, None
-
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
 
@@ -718,100 +529,8 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
             return dict(row) if row else None
 
-    def _run_migration(self, version):
-        migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")
-        matches = list(migration.parent.glob(migration.name))
-        if len(matches) != 1:
-            raise ValidationError(f"migration {version} is missing or ambiguous")
-        if version == 19:
-            self._run_executor_authority_migration()
-            return
-        if version == 21:
-            self._run_executor_identity_migration()
-            return
-        script = matches[0].read_text(encoding="utf-8")
-        self.conn.executescript("BEGIN IMMEDIATE;\n" + script + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\nCOMMIT;")
-
     def _table_columns(self, table):
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
-
-    def _table_exists(self, table):
-        return self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone() is not None
-
-    def _run_executor_authority_migration(self):
-        """Apply schema 19 across both transitional and partially-upgraded realms.
-
-        SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``.  Some
-        historical receipt fixtures (and a process interrupted after the
-        structural part of schema 19) can therefore have the new executor
-        columns while still advertising a pre-19 migration marker.  Build the
-        small set of DDL/DML steps from the live shape under one transaction so
-        startup is retryable and never leaves a second authority behind.
-        """
-        with self._transaction():
-            executor_columns = self._table_columns("executors")
-            for column, definition in (
-                ("readiness", "TEXT NOT NULL DEFAULT 'ready'"),
-                ("readiness_reason", "TEXT"),
-                ("last_seen_at", "TEXT"),
-            ):
-                if column not in executor_columns:
-                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} {definition}")
-
-            workers_exists = self._table_exists("workers")
-            if workers_exists:
-                self.conn.execute(
-                    """INSERT INTO executors(
-                        id, max_concurrency, resource_keys_json, capabilities_json,
-                        protocol, created_at, runtime_epoch, readiness,
-                        readiness_reason, last_seen_at
-                    )
-                    SELECT
-                        w.id, w.max_concurrency, w.resource_keys_json,
-                        w.capabilities_json, 'workspace.v1', w.created_at,
-                        w.runtime_epoch, w.readiness, w.readiness_reason,
-                        w.last_seen_at
-                    FROM workers AS w
-                    WHERE NOT EXISTS (SELECT 1 FROM executors AS e WHERE e.id = w.id)"""
-                )
-
-            for table in ("tasks", "reservations"):
-                columns = self._table_columns(table)
-                if "worker_id" in columns and "executor_id" in columns:
-                    raise ValidationError(
-                        f"schema 19 found both worker_id and executor_id in {table}"
-                    )
-                if "worker_id" in columns:
-                    self.conn.execute(
-                        f"ALTER TABLE {table} RENAME COLUMN worker_id TO executor_id"
-                    )
-
-            self.conn.execute("DROP INDEX IF EXISTS idx_tasks_worker_status")
-            self.conn.execute("DROP INDEX IF EXISTS idx_reservations_active")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_executor_status ON tasks(executor_id, status)"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations(executor_id, resource_key, released_at)"
-            )
-            if workers_exists:
-                self.conn.execute("DROP TABLE workers")
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (19, datetime('now'))"
-            )
-
-    def _run_executor_identity_migration(self):
-        """Apply schema 21 safely after an interrupted structural upgrade."""
-        with self._transaction():
-            executor_columns = self._table_columns("executors")
-            for column in ("source_digest", "dependency_digest", "source_epoch"):
-                if column not in executor_columns:
-                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} TEXT")
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (21, datetime('now'))"
-            )
 
     def close(self):
         with self._mutex:
@@ -3107,7 +2826,7 @@ class RealmStore:
         """
         return self.integrity_report(catalog_path=catalog_path)
 
-    def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, allow_migration: bool = False):
+    def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         """Return a bounded report even when SQLite metadata is malformed."""
         if timeout_seconds <= 0:
             return self._integrity_failure("timeout", "realm inspection timed out")
@@ -3122,7 +2841,7 @@ class RealmStore:
         with self._mutex:
             self.conn.set_progress_handler(progress, 1000)
             try:
-                return self._integrity_report(catalog_path=catalog_path, allow_migration=allow_migration, deadline=deadline)
+                return self._integrity_report(catalog_path=catalog_path, deadline=deadline)
             except TimeoutError as exc:
                 return self._integrity_failure("timeout", str(exc))
             except (sqlite3.DatabaseError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -3130,7 +2849,7 @@ class RealmStore:
             finally:
                 self.conn.set_progress_handler(None, 0)
 
-    def _integrity_report(self, *, catalog_path=None, allow_migration=False, deadline=None):
+    def _integrity_report(self, *, catalog_path=None, deadline=None):
         try:
             quick_rows = [str(row[0]) for row in self.conn.execute("PRAGMA quick_check").fetchall()]
             quick = "ok" if quick_rows == ["ok"] else quick_rows
@@ -3167,7 +2886,6 @@ class RealmStore:
             table for table in actual_tables
             if not str(table).startswith("sqlite_") and table not in REQUIRED_SCHEMA_TABLES
         )
-        legacy_tables = sorted(set(unexpected_tables) & _LEGACY_SCHEMA_TABLES)
         schema_ok = (
             actual_schema == SCHEMA_VERSION
             and actual_format == CANONICAL_FORMAT_ID
@@ -3309,7 +3027,6 @@ class RealmStore:
                     "missing_columns": missing_columns,
                     "extra_columns": extra_columns,
                     "unexpected_tables": unexpected_tables,
-                    "legacy_tables": legacy_tables,
                 },
                 "realm_identity": realm_identity,
                 "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},

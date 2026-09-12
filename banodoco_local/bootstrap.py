@@ -1,20 +1,17 @@
 """T2 neutral one-realm launch/reconnect lifecycle.
 
-The boundary protocol is intentionally tiny.  A real generated workspace
-client can implement it; tests use a fake.  Runtime ownership stays behind
-that boundary; the activation verifier only performs read-only artifact
-checks before a legacy-root collision may be waived.
+The boundary protocol is intentionally tiny. A real generated workspace
+client can implement it; tests use a fake. Runtime ownership stays behind
+that boundary and legacy roots are always rejected.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import hmac
 import json
 import os
 from pathlib import Path
-import sqlite3
 import secrets
 import shutil
 import stat
@@ -44,8 +41,8 @@ WORKER_SCOPES = (
     "objects:write",
 )
 LEGACY_NEXT_ACTION = (
-    "Run the offline migrator before launching: "
-    "banodoco-local migrate --profile astrid --source {legacy_root}"
+    "Legacy realm roots are unsupported; preserve {legacy_root} and "
+    "provision a fresh canonical realm before launching."
 )
 RECONFIGURE_NEXT_ACTION = (
     "Restart the runtime with a compatible source profile: "
@@ -258,87 +255,8 @@ def _legacy_collision(paths: RuntimePaths, configured: tuple[Path, ...]) -> Path
         # lexists is intentional: a dangling legacy symlink is still a
         # collision and must not be bypassed by a stale/empty catalog.
         if os.path.lexists(str(root)) and (root.is_dir() or root.is_file() or root.is_symlink()):
-            if root == paths.home / ".astrid" and _verified_activation_manifest(paths):
-                continue
             return root
     return None
-
-
-def _canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-
-def _durable_activation_trust_key(paths: RuntimePaths, *, provision: bool = False) -> bytes | None:
-    """Read or provision the owner-only activation trust anchor.
-
-    This file lives in runtime support, outside the migration archive,
-    destination realm, and activation registry.  A migration may create it
-    once, but neither bootstrap nor migration ever derive it from artifacts.
-    """
-    path = paths.activation_trust_path
-    try:
-        # Read through a retained parent descriptor and ``openat`` with
-        # ``O_NOFOLLOW``.  The previous lexical ``is_file``/``stat`` checks
-        # followed by ``read_json(path)`` let a concurrent replacement swap
-        # the anchor for a symlink between validation and use, turning the
-        # trust source into a path-resolution race.
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open(path.parent, directory_flags)
-        try:
-            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(path.name, file_flags, dir_fd=parent_fd)
-            try:
-                metadata = os.fstat(fd)
-                owner_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
-                if (not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_uid != owner_uid
-                        or stat.S_IMODE(metadata.st_mode) != 0o600):
-                    return None
-                data = bytearray()
-                while True:
-                    chunk = os.read(fd, 1024 * 1024)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                value = json.loads(bytes(data).decode("utf-8"))
-            finally:
-                os.close(fd)
-        finally:
-            os.close(parent_fd)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        value = None
-    if isinstance(value, Mapping) and value.get("version") == 1:
-        encoded = value.get("key_hex")
-        if isinstance(encoded, str):
-            try:
-                key = bytes.fromhex(encoded)
-            except ValueError:
-                key = None
-            if key is not None and len(key) >= 32:
-                return key
-    if not provision:
-        # An absent support key is an unverified activation. Only the durable
-        # owner-only anchor can authorize a legacy-root waiver.
-        return None
-    key = secrets.token_bytes(32)
-    atomic_write_json(path, {"version": 1, "key_hex": key.hex()})
-    return key
-
-
-def _sha256_regular(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    digest = hashlib.sha256()
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(f"not a regular file: {path}")
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
-    finally:
-        os.close(fd)
 
 
 def _read_json_regular(path: Path) -> Any:
@@ -356,11 +274,6 @@ def _read_json_regular(path: Path) -> Any:
         return json.loads(bytes(data).decode("utf-8"))
     finally:
         os.close(fd)
-
-
-def _stat_digest(path: Path) -> dict[str, int]:
-    value = path.stat(follow_symlinks=False)
-    return {"st_dev": int(value.st_dev), "st_ino": int(value.st_ino), "st_mode": int(value.st_mode)}
 
 
 def _has_symlink_component(path: Path) -> bool:
@@ -447,12 +360,12 @@ def _worker_handoff(value: Mapping[str, Any] | None) -> dict[str, Any]:
 def _validate_support_paths(paths: RuntimePaths) -> None:
     """Validate the fixed support composition before reading or writing it."""
     directories = (
-        paths.home, paths.app_support, paths.runtime_support, paths.activations_dir,
+        paths.home, paths.app_support, paths.runtime_support,
         paths.credentials_dir, paths.runtime_support / "credentials", paths.realms_dir,
         paths.source_profiles_dir,
     )
     files = (
-        paths.catalog_path, paths.discovery_path, paths.activation_trust_path,
+        paths.catalog_path, paths.discovery_path,
         paths.instance_lock_path, paths.bootstrap_lock_path,
         paths.runtime_support / "credentials" / "owner.token",
         paths.runtime_support / "credentials" / "owner.json",
@@ -498,152 +411,6 @@ def _read_support_json(path: Path) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         raise BootstrapError(f"Neutral support file must contain an object: {path}")
     return dict(value)
-
-
-def _cas_inventory(root: Path) -> list[dict[str, Any]]:
-    result = []
-    cas = root / "cas"
-    if not cas.is_dir() or cas.is_symlink():
-        raise OSError("CAS root is unavailable")
-    for path in sorted(cas.rglob("*")):
-        if path.is_symlink():
-            raise OSError("CAS contains a symlink")
-        if path.is_file():
-            result.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_regular(path)})
-    return result
-
-
-def _cas_digest(root: Path) -> str:
-    return hashlib.sha256(_canonical_json(_cas_inventory(root))).hexdigest()
-
-
-def _source_tree_digest(root: Path) -> str:
-    if root.is_symlink() or not root.is_dir():
-        raise OSError("archive source tree is unavailable")
-    result = []
-    for path in sorted(root.rglob("*")):
-        relative = str(path.relative_to(root))
-        if path.is_symlink():
-            resolved = path.resolve(strict=False)
-            try:
-                resolved.relative_to(root.resolve())
-                inside = True
-            except ValueError:
-                inside = False
-            result.append({"path": relative, "kind": "symlink", "target": os.readlink(path), "resolved_inside_root": inside})
-        elif path.is_file():
-            result.append({"path": relative, "kind": "file", "size": path.stat().st_size, "sha256": _sha256_regular(path)})
-    return hashlib.sha256(_canonical_json(result)).hexdigest()
-
-
-def _verified_activation_manifest(paths: RuntimePaths) -> bool:
-    """Verify a complete activation registry against every referenced byte."""
-    trust_key = _durable_activation_trust_key(paths)
-    if trust_key is None:
-        return False
-    if paths.activations_dir.is_symlink() or not paths.activations_dir.is_dir():
-        return False
-    try:
-        manifests = tuple(paths.activations_dir.glob("*.json"))
-    except OSError:
-        return False
-    for path in manifests:
-        try:
-            if path.is_symlink() or not path.is_file() or path.name.startswith("."):
-                continue
-            value = _read_json_regular(path)
-            if not isinstance(value, Mapping) or value.get("registry_version") != 1 or value.get("state") != "activated":
-                continue
-            registry_hash = value.get("registry_sha256")
-            unsigned = {key: item for key, item in value.items() if key != "registry_sha256"}
-            if not isinstance(registry_hash, str) or registry_hash != hashlib.sha256(_canonical_json(unsigned)).hexdigest():
-                continue
-            required = ("realm_id", "source_archive", "source_archive_sha256", "source_archive_identity", "source_manifest_sha256",
-                        "source_archive_tree_sha256", "destination_root", "destination_identity",
-                        "destination_database_sha256", "cas_inventory_sha256", "cas_inventory",
-                        "migration_report", "migration_report_sha256", "activation_manifest",
-                        "activation_manifest_sha256", "runtime_version", "schema_version",
-                        "protocol_version", "importer_version", "source_version", "reconciliation",
-                        "activation_signature")
-            if any(not isinstance(value.get(key), (str, dict, list)) or value[key] in ("", None) for key in required):
-                continue
-            if (value["protocol_version"] != PROTOCOL_VERSION
-                    or value["schema_version"] != SCHEMA_VERSION
-                    or value["runtime_version"] != RUNTIME_VERSION
-                    or value["importer_version"] != IMPORTER_VERSION):
-                continue
-            hex_fields = ("source_archive_sha256", "source_manifest_sha256", "source_archive_tree_sha256",
-                          "destination_database_sha256", "cas_inventory_sha256", "migration_report_sha256",
-                          "activation_manifest_sha256")
-            if any(not isinstance(value.get(key), str) or len(value[key]) != 64 or any(c not in "0123456789abcdef" for c in value[key]) for key in hex_fields):
-                continue
-            destination = Path(str(value["destination_root"]))
-            archive = Path(str(value["source_archive"]))
-            report = Path(str(value["migration_report"]))
-            activation = Path(str(value["activation_manifest"]))
-            if any(not item.is_absolute() or _has_symlink_component(item) or item.is_symlink() for item in (destination, archive, report, activation)):
-                continue
-            if destination != Path(os.path.realpath(destination)) or not destination.is_dir():
-                continue
-            if value["activation_manifest"] != str(destination / "activation-manifest.json") or activation != destination / "activation-manifest.json":
-                continue
-            if value["realm_id"] != path.stem:
-                continue
-            if _stat_digest(destination) != value["destination_identity"] or _stat_digest(archive) != value["source_archive_identity"]:
-                continue
-            if _sha256_regular(activation) != value["activation_manifest_sha256"] or _sha256_regular(destination / "realm.sqlite3") != value["destination_database_sha256"]:
-                continue
-            if _cas_digest(destination) != value["cas_inventory_sha256"] or _cas_inventory(destination) != value["cas_inventory"]:
-                continue
-            if not archive.is_dir() or _sha256_regular(archive / "manifest.json") != value["source_archive_sha256"]:
-                continue
-            archive_manifest = _read_json_regular(archive / "manifest.json")
-            if not isinstance(archive_manifest, Mapping):
-                continue
-            if (archive_manifest.get("source_version") != value["source_version"]
-                    or archive_manifest.get("source_manifest_sha256") != value["source_manifest_sha256"]
-                    or archive_manifest.get("archive_source_tree_sha256") != value["source_archive_tree_sha256"]
-                    or archive_manifest.get("files_sha256") != value["source_archive_tree_sha256"]
-                    or _source_tree_digest(archive / "source") != value["source_archive_tree_sha256"]):
-                continue
-            report_value = _read_json_regular(report)
-            if not isinstance(report_value, Mapping):
-                continue
-            if hashlib.sha256(_canonical_json(report_value)).hexdigest() != value["migration_report_sha256"]:
-                continue
-            activation_value = _read_json_regular(activation)
-            if not isinstance(activation_value, Mapping):
-                continue
-            activation_expected = {key: item for key, item in value.items() if key not in {"registry_version", "registry_sha256", "activation_manifest", "activation_manifest_sha256"}}
-            if activation_value != activation_expected:
-                continue
-            signature = activation_value.get("activation_signature")
-            unsigned_activation = {key: item for key, item in activation_value.items() if key != "activation_signature"}
-            expected_signature = hmac.new(trust_key, _canonical_json(unsigned_activation), hashlib.sha256).hexdigest()
-            if (not isinstance(signature, str)
-                    or not hmac.compare_digest(signature, expected_signature)):
-                continue
-            reconciliation = activation_value.get("reconciliation")
-            if (activation_value.get("state") != "activated"
-                    or not isinstance(reconciliation, Mapping)
-                    or reconciliation.get("ok") is not True):
-                continue
-            with sqlite3.connect((destination / "realm.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
-                realm = db.execute("SELECT id FROM realm LIMIT 1").fetchone()
-            if not realm or str(realm[0]) != str(value["realm_id"]):
-                continue
-            catalog = _read_catalog(paths)
-            rows = [row for row in catalog.get("realms", []) if isinstance(row, Mapping) and str(row.get("realm_id")) == str(value["realm_id"])]
-            if catalog.get("selected_realm_id") != value["realm_id"] or len(rows) != 1:
-                continue
-            catalog_root = Path(str(rows[0].get("data_root", "")))
-            if (not catalog_root.is_absolute() or _has_symlink_component(catalog_root)
-                    or catalog_root != destination or os.path.realpath(str(catalog_root)) != str(destination)):
-                continue
-            return True
-        except (OSError, ValueError, TypeError, sqlite3.Error, BootstrapError):
-            continue
-    return False
 
 
 def _new_realm_id() -> str:
@@ -870,7 +637,7 @@ def bootstrap(
     _validate_support_paths(paths)
     # Collision detection is deliberately before the mutex/support directory:
     # a legacy checkout must never cause even neutral launch state to be
-    # created, and the user must be directed to the offline migrator first.
+    # created, and the user must be directed to fresh canonical provisioning.
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
     collision = _legacy_collision(paths, config.legacy_roots)

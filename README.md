@@ -33,8 +33,9 @@ python3 -m runtime_protocol replace --root .runtime --backup ./realm-backup
 
 Replacement retains the superseded root for recovery evidence, rotates the
 owner credentials, advances the Runtime epoch, and publishes readiness only
-after the new owner has passed admission. Old realms and backups are not
-migrated or salvaged by Runtime.
+after the new owner has passed admission. Old realms and backups are
+unsupported and are neither migrated nor salvaged by Runtime; preserve them
+for an explicitly owned offline disposition.
 
 `start` prints the loopback endpoint and owner credential path, then keeps the
 daemon alive until SIGINT/SIGTERM. The test suite demonstrates the workspace.v1

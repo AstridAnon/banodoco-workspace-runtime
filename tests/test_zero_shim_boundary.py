@@ -17,13 +17,13 @@ def test_cli_accepts_only_canonical_spellings():
     parse(["backup", "--destination", "backup"])
     parse(["prepare-reboot", "--attempt-id", "a", "--lease-id", "l", "--fence", "1", "--runtime-epoch", "1"])
     parse(["recovery", "--expected-realm-id", "realm", "--expected-version", "1", "--non-interactive"])
-    parse(["migrate", "--source", "source", "--archive", "archive", "--destination", "destination"])
-
     for argv in (
         ["backup", "--out", "backup"],
         ["prepare"],
         ["recover"],
         ["recovery", "--realm-id", "realm", "--expected-version", "1", "--non-interactive"],
+        ["migrate", "--source", "source", "--archive", "archive", "--destination", "destination"],
+        ["rehearse", "--source", "source", "--archive", "archive", "--destination", "destination"],
         ["migrate", "--source-root", "source", "--archive-root", "archive", "--destination-root", "destination"],
     ):
         with pytest.raises(SystemExit):

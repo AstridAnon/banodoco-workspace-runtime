@@ -12,25 +12,10 @@ dependencies = []
 [project.scripts]
 banodoco-runtime = "runtime_protocol.cli:main"
 banodoco-local = "banodoco_local.cli:main"
-astrid-live-migrate = "banodoco_local.astrid_live:main"
-
-[tool.setuptools]
-# The offline migrator owns the shared public error taxonomy.  Package that
-# small module with the migrator so an installed `banodoco-local migrate` has
-# the same boundary as a source checkout, without making the live runtime
-# import migration code.
-py-modules = ["migration_boundary"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.setuptools.packages.find]
-include = ["runtime_protocol*", "banodoco_local*", "tools*"]
-
-# Migrations are runtime data, not optional source files.  Keep them in every
-# wheel/sdist so an installed ``banodoco-runtime start`` has the same schema
-# bootstrap as a checkout launch.
-[tool.setuptools.package-data]
-runtime_protocol = ["migrations/*.sql"]
-"tools.astrid_migrate" = ["evidence/*.json"]
+include = ["runtime_protocol*", "banodoco_local*"]

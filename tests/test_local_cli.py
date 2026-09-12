@@ -30,8 +30,6 @@ class _TypedClient:
 
 def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     required = {
-        "migrate": ["--source", "s", "--archive", "a", "--destination", "d"],
-        "rehearse": ["--source", "s", "--archive", "a", "--destination", "d"],
         "backup": ["--destination", "b"],
         "restore": ["backup", "--destination", "d"],
         "checkpoint": ["--attempt-id", "a", "--lease-id", "l", "--fence", "1", "--runtime-epoch", "1", "--nonce", "n", "--authorization", "n"],
@@ -40,7 +38,7 @@ def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
         "resume": ["--checkpoint-id", "c", "--nonce", "n", "--authorization", "n", "--runtime-epoch", "1"],
         "recovery": [],
     }
-    for command in ("up", "connect", "status", "restart", "migrate", "rehearse", "backup", "restore", "checkpoint", "prepare-reboot", "reboot", "resume", "doctor", "recovery"):
+    for command in ("up", "connect", "status", "restart", "backup", "restore", "checkpoint", "prepare-reboot", "reboot", "resume", "doctor", "recovery"):
         assert cli.parser().parse_args([command, *required.get(command, []), "--json"]).command == command
 
 
@@ -66,14 +64,3 @@ def test_reboot_is_safe_disabled_and_resume_is_typed(monkeypatch, tmp_path, caps
     resume_args = ["resume", "--home", str(tmp_path), "--checkpoint-id", "c", "--nonce", "n", "--authorization", "n", "--runtime-epoch", "7", "--json"]
     assert cli.main(resume_args) == 0
     assert fake.calls[-1][0] == "resume"
-
-
-def test_rehearse_is_non_mutating_dispatch(monkeypatch, tmp_path, capsys):
-    seen = {}
-    def fake_migrate(args, paths, *, dry_run):
-        seen.update(source=args.source_root, archive=args.archive_root, destination=args.destination_root, dry_run=dry_run)
-        return {"dry_run": dry_run}
-    monkeypatch.setattr(cli, "_migrate", fake_migrate)
-    assert cli.main(["rehearse", "--home", str(tmp_path), "--source", "src", "--archive", "arc", "--destination", "dst", "--json"]) == 0
-    assert seen == {"source": Path("src"), "archive": Path("arc"), "destination": Path("dst"), "dry_run": True}
-    assert json.loads(capsys.readouterr().out)["dry_run"] is True

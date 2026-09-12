@@ -30,8 +30,14 @@ def _tree_bytes(root: Path) -> dict[str, str]:
 
 
 def _new_service(root: Path, **kwargs):
-    RealmStore.initialize(root).close()
+    initialize_kwargs = {key: kwargs[key] for key in ("display_name", "realm_id") if key in kwargs}
+    RealmStore.initialize(root, **initialize_kwargs).close()
     return RuntimeService(root, **kwargs)
+
+
+def _new_daemon(root: Path, support_root: Path):
+    RealmStore.initialize(root).close()
+    return RuntimeDaemon(root, support_root=support_root).start()
 
 
 def test_corrupt_startup_fails_before_credentials_catalog_discovery_or_server(tmp_path):
@@ -95,35 +101,6 @@ def test_malformed_doctor_is_structured_bounded_and_non_mutating(tmp_path, capsy
     assert _tree_bytes(root) == before
 
 
-def test_preflight_migrates_only_its_isolated_copy_before_rejecting_bad_schema(tmp_path):
-    root = tmp_path / "realm"
-    service = RuntimeService(root)
-    service.close()
-    connection = sqlite3.connect(root / "realm.sqlite3")
-    try:
-        connection.execute("DROP TABLE executors")
-        connection.execute("DELETE FROM schema_migrations WHERE version=23")
-        connection.commit()
-    finally:
-        connection.close()
-    database = root / "realm.sqlite3"
-    before = database.read_bytes()
-
-    report = RealmStore.inspect_realm(root, allow_migration=True)
-    assert report["ok"] is False
-    assert "executors" in report["checks"]["schema"]["missing_tables"]
-    assert database.read_bytes() == before
-    with pytest.raises(RealmAdmissionError):
-        RealmStore(root)
-    assert database.read_bytes() == before
-
-    immutable = sqlite3.connect(f"file:{database}?immutable=1", uri=True)
-    try:
-        assert immutable.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 22
-    finally:
-        immutable.close()
-
-
 def test_existing_realm_missing_attempts_table_fails_admission(tmp_path):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
@@ -134,7 +111,7 @@ def test_existing_realm_missing_attempts_table_fails_admission(tmp_path):
     finally:
         connection.close()
 
-    report = RealmStore.inspect_realm(root, allow_migration=True)
+    report = RealmStore.inspect_realm(root)
     assert report["ok"] is False
     assert report["checks"]["schema"]["ok"] is False
     assert "attempts" in report["checks"]["schema"]["missing_tables"]
@@ -153,7 +130,7 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
     finally:
         connection.close()
 
-    report = RealmStore.inspect_realm(root, allow_migration=True)
+    report = RealmStore.inspect_realm(root)
     assert report["ok"] is False
     assert report["issues"] == ["schema"]
     assert report["checks"]["schema"] == {
@@ -166,7 +143,6 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
         "missing_columns": {"attempts": ["lease_id"]},
         "extra_columns": {},
         "unexpected_tables": [],
-        "legacy_tables": [],
     }
     with pytest.raises(RealmAdmissionError) as error:
         RuntimeService(root)
@@ -197,7 +173,7 @@ def test_existing_realm_requires_one_unambiguous_identity(tmp_path, mutation, re
     finally:
         connection.close()
 
-    report = RealmStore.inspect_realm(root, allow_migration=True)
+    report = RealmStore.inspect_realm(root)
     assert report["ok"] is False
     assert report["checks"]["realm_identity"]["ok"] is False
     assert report["checks"]["realm_identity"]["reason"] == reason
@@ -208,12 +184,11 @@ def test_existing_realm_requires_one_unambiguous_identity(tmp_path, mutation, re
 
 def test_runtime_strict_identity_admission_rejects_before_open_and_preserves_bytes(tmp_path):
     root = tmp_path / "realm"
-    RuntimeService(root).close()
+    RealmStore.initialize(root).close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         connection.execute("DELETE FROM realm_lifecycle")
         connection.execute("DELETE FROM realm")
-        connection.execute("DELETE FROM schema_migrations WHERE version=23")
         connection.commit()
     finally:
         connection.close()
@@ -224,15 +199,10 @@ def test_runtime_strict_identity_admission_rejects_before_open_and_preserves_byt
 
     assert error.value.details["checks"]["realm_identity"]["reason"] == "realm_identity_missing"
     assert _tree_bytes(root) == before
-    immutable = sqlite3.connect(f"file:{root / 'realm.sqlite3'}?immutable=1", uri=True)
-    try:
-        assert immutable.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 22
-    finally:
-        immutable.close()
 
 
 def test_wal_only_commit_survives_owned_backup_and_restore(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     try:
         service.store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         service.store.conn.execute("PRAGMA wal_autocheckpoint=0")
@@ -283,7 +253,7 @@ def test_candidate_verification_is_byte_safe_and_rejects_unmanifested_sidecars(t
 
 
 def test_executor_descriptor_upserts_and_rolls_back_partial_visibility(tmp_path, monkeypatch):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     old_digest = "sha256:" + "a" * 64
     new_digest = "sha256:" + "c" * 64
     try:
@@ -323,7 +293,7 @@ def test_executor_descriptor_upserts_and_rolls_back_partial_visibility(tmp_path,
 
 
 def test_capability_catalog_read_waits_for_atomic_executor_registration(tmp_path, monkeypatch):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     first_descriptor_written = threading.Event()
     release_registration = threading.Event()
     reader_started = threading.Event()
@@ -384,7 +354,7 @@ def test_capability_catalog_read_waits_for_atomic_executor_registration(tmp_path
 
 
 def test_health_degradation_revokes_mutations_and_http_errors_are_request_correlated(tmp_path):
-    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    daemon = _new_daemon(tmp_path / "realm", tmp_path / "support")
     try:
         result = daemon.service.ingest_object(b"health-corruption", idempotency_key="health-object")
         digest = result["data"]["digest"].removeprefix("sha256:")
@@ -419,7 +389,7 @@ def test_health_degradation_revokes_mutations_and_http_errors_are_request_correl
 
 
 def test_writer_holds_admission_fence_through_commit_during_degradation(tmp_path, monkeypatch):
-    service = RuntimeService(tmp_path / "realm")
+    service = _new_service(tmp_path / "realm")
     writer_in_body = threading.Event()
     release_writer = threading.Event()
     health_attempting_fence = threading.Event()

@@ -19,7 +19,6 @@ class RuntimePaths:
     runtime_support: Path
     catalog_path: Path
     discovery_path: Path
-    activations_dir: Path
     credentials_dir: Path
     realms_dir: Path
     source_profiles_dir: Path
@@ -37,7 +36,6 @@ class RuntimePaths:
             runtime_support=runtime,
             catalog_path=runtime / "catalog.json",
             discovery_path=runtime / "discovery.json",
-            activations_dir=runtime / "activations",
             credentials_dir=app_support / "credentials",
             realms_dir=runtime / "realms",
             source_profiles_dir=runtime / "source-profiles",
@@ -51,16 +49,10 @@ class RuntimePaths:
 
         return cls.current_mac(Path(root))
 
-    @property
-    def activation_trust_path(self) -> Path:
-        """Owner-only trust anchor kept outside all realm/migration artifacts."""
-        return self.runtime_support / "activation-trust.json"
-
     def ensure_support_dirs(self) -> None:
         for directory in (
             self.app_support,
             self.runtime_support,
-            self.activations_dir,
             self.credentials_dir,
             self.realms_dir,
             self.source_profiles_dir,

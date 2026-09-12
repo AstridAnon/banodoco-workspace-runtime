@@ -1,6 +1,6 @@
 """The one fresh-realm SQLite format owned by Runtime.
 
-This is deliberately a schema declaration, not a migration runner.  A realm
+This is deliberately a schema declaration, not a runtime repair runner. A realm
 is created explicitly from this format; an existing database must already
 match it and is never upgraded while being opened or inspected.
 """
