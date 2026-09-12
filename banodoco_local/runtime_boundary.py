@@ -218,6 +218,59 @@ class LocalRuntimeBoundary:
             argv += ["--bootstrap-token-file", str(token_file)]
         return argv
 
+    def create(self, *, realm_id: str, realm_root: Path, display_name: str, source_profile: SourceProfile) -> Mapping[str, Any]:
+        """Explicitly provision one fresh realm before launching its daemon.
+
+        Ordinary ``start`` remains an open/admission operation and therefore
+        refuses a missing or invalid realm.  This separate subprocess invokes
+        the Runtime's canonical creation command, keeping schema, identity,
+        and ownership inside Runtime rather than recreating them in the
+        neutral launcher.
+        """
+        realm_root = self._validate_path(Path(realm_root), "realm root").resolve()
+        if realm_root.exists() or realm_root.is_symlink():
+            raise BootstrapError("fresh realm creation requires a new root")
+        self._validate_source(source_profile)
+        if source_profile.runtime_command:
+            raise BootstrapError("explicit realm creation requires the pinned runtime environment")
+        python = sys.executable
+        if source_profile.runtime_environment:
+            candidate = Path(source_profile.runtime_environment).expanduser().resolve() / "bin" / "python"
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                raise BootstrapError(
+                    "Configured runtime environment is missing its installed Python: "
+                    f"{candidate}"
+                )
+            python = str(candidate)
+        argv = [
+            python, "-m", "runtime_protocol", "create",
+            "--root", str(realm_root),
+            "--display-name", display_name,
+            "--realm-id", realm_id,
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise BootstrapError("Runtime realm creation could not start.") from exc
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            raise BootstrapError(
+                "Runtime realm creation failed: " + (output or "no diagnostic")
+            )
+        try:
+            created = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BootstrapError("Runtime realm creation returned invalid metadata.") from exc
+        if not isinstance(created, Mapping):
+            raise BootstrapError("Runtime realm creation returned invalid metadata.")
+        return created
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process and self._process.poll() is None:
             raise BootstrapError("runtime boundary already owns a live daemon")
