@@ -83,6 +83,9 @@ class RuntimeBoundary(Protocol):
     and object-store ownership inside that daemon.
     """
 
+    def create(self, *, realm_id: str, realm_root: Path, display_name: str,
+               source_profile: "SourceProfile") -> Mapping[str, Any]: ...
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path,
               source_profile: "SourceProfile") -> Mapping[str, Any]: ...
 
@@ -1015,6 +1018,26 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
     source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
     try:
+        if new_realm:
+            create = getattr(boundary, "create", None)
+            if not callable(create):
+                raise BootstrapError(
+                    "The runtime boundary cannot explicitly provision a fresh realm."
+                )
+            created = create(
+                realm_id=realm_id,
+                realm_root=realm_root,
+                display_name=str(realm["display_name"]),
+                source_profile=source,
+            )
+            if (
+                not isinstance(created, Mapping)
+                or created.get("state") != "created"
+                or str(created.get("realm_id")) != realm_id
+            ):
+                raise BootstrapError(
+                    "Runtime realm creation returned incomplete or mismatched identity."
+                )
         handle = boundary.start(
             realm_id=realm_id,
             realm_root=realm_root,
