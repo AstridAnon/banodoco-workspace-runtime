@@ -14,7 +14,6 @@ from .bootstrap import (
     BootstrapConfig,
     BootstrapError,
     SourceProfile,
-    _durable_activation_trust_key,
     _read_catalog,
     _read_support_json,
     _validate_loopback_endpoint,
@@ -71,13 +70,6 @@ def parser() -> argparse.ArgumentParser:
     restore.add_argument("backup", type=Path)
     restore.add_argument("--destination", required=True, type=Path)
 
-    migrate_cmd = sub.add_parser("migrate", help="run the offline Astrid migration through the runtime client")
-    _read_args(migrate_cmd)
-    _migration_args(migrate_cmd)
-    rehearse = sub.add_parser("rehearse", help="dry-run the offline migration without activating it")
-    _read_args(rehearse)
-    _migration_args(rehearse)
-
     checkpoint = sub.add_parser("checkpoint", help="persist a nonce-bound recovery checkpoint")
     _read_args(checkpoint)
     _attempt_args(checkpoint)
@@ -119,13 +111,6 @@ def _profile_args(command: argparse.ArgumentParser) -> None:
 def _read_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--json", action="store_true")
     command.add_argument("--home", type=Path, help="override the current-Mac support home (mainly for disposable roots)")
-
-
-def _migration_args(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--source", dest="source_root", required=True, type=Path)
-    command.add_argument("--archive", dest="archive_root", required=True, type=Path)
-    command.add_argument("--destination", dest="destination_root", required=True, type=Path)
-    command.add_argument("--dry-run", action="store_true", help="validate and report without importing or activating")
 
 
 def _attempt_args(command: argparse.ArgumentParser) -> None:
@@ -217,16 +202,6 @@ def _load_state(raw: str) -> Mapping[str, Any]:
     return value
 
 
-def _migrate(args: argparse.Namespace, paths: RuntimePaths, *, dry_run: bool) -> Mapping[str, Any]:
-    # The migrator is intentionally offline and source-root scoped.  It gets
-    # only the generated client, never a RealmStore or direct SQLite handle.
-    from tools.astrid_migrate import MigrationConfig, migrate
-    _validate_support_paths(paths)
-    client = _client(paths) if _read_support_json(paths.discovery_path) else None
-    trust_key = _durable_activation_trust_key(paths, provision=not dry_run)
-    return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run, activation_registry_root=paths.activations_dir, activation_trust_key=trust_key), client)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     paths = _paths(args)
@@ -289,9 +264,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "restore":
             _emit(_client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())), json_mode=args.json)
-            return 0
-        if args.command in {"migrate", "rehearse"}:
-            _emit(_migrate(args, paths, dry_run=args.command == "rehearse" or args.dry_run), json_mode=args.json)
             return 0
         if args.command == "checkpoint":
             client = _client(paths)

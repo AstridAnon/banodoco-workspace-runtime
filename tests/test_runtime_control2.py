@@ -12,10 +12,22 @@ from runtime_protocol.errors import CapabilityUnavailableError, ConflictError, L
 from runtime_protocol.daemon import RuntimeDaemon
 from http_helpers import Api
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(name: str) -> str:
     return "sha256:" + hashlib.sha256(name.encode()).hexdigest()
+
+
+def _service(root, **kwargs):
+    initialize_kwargs = {key: kwargs[key] for key in ("display_name", "realm_id") if key in kwargs}
+    RealmStore.initialize(root, **initialize_kwargs).close()
+    return RuntimeService(root, **kwargs)
+
+
+def _daemon(root, support_root):
+    RealmStore.initialize(root).close()
+    return RuntimeDaemon(root, support_root=support_root).start()
 
 
 def _task(service: RuntimeService, key: str):
@@ -61,7 +73,7 @@ def _settle_attempt(service: RuntimeService, attempt: dict, *, effect=None, idem
 
 
 def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({
             "capability_id": "render.gpu",
@@ -88,7 +100,7 @@ def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_p
 
 
 def test_missing_named_resource_has_exact_resource_waiting_reason(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
         service.register_executor({"executor_id": "cpu-worker", "capabilities": ["render.gpu"], "resource_keys": ["cpu"]}, idempotency_key="cpu-worker-register")
@@ -101,7 +113,7 @@ def test_missing_named_resource_has_exact_resource_waiting_reason(tmp_path):
 
 
 def test_unavailable_capability_never_claims_even_when_worker_is_ready(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "status": "unavailable", "unavailable_reason": "model_missing"})
         service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "resource_keys": []}, idempotency_key="unavailable-worker-register")
@@ -114,7 +126,7 @@ def test_unavailable_capability_never_claims_even_when_worker_is_ready(tmp_path)
 
 
 def test_worker_readiness_and_heartbeat_control_admission(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
         service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "resource_keys": ["gpu"], "readiness": "not_ready", "readiness_reason": "warming_up"}, idempotency_key="readiness-worker-register")
@@ -134,7 +146,7 @@ def test_worker_readiness_and_heartbeat_control_admission(tmp_path):
 
 
 def test_executor_registration_uses_same_worker_capacity_contract(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         registered = service.register_executor({"executor_id": "executor", "max_concurrency": 2, "resource_keys": ["cpu"], "capabilities": ["render.basic"], "protocol": "workspace.v1"}, idempotency_key="executor-register")
         assert registered["max_concurrency"] == 2
@@ -146,7 +158,7 @@ def test_executor_registration_uses_same_worker_capacity_contract(tmp_path):
 
 
 def test_http_executor_claim_heartbeat_and_release_surface(tmp_path):
-    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    daemon = _daemon(tmp_path / "realm", tmp_path / "support")
     try:
         owner = Api(daemon.endpoint, daemon.token)
         owner.request("POST", "/v1/capabilities", {"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
@@ -167,7 +179,7 @@ def test_http_executor_claim_heartbeat_and_release_surface(tmp_path):
 
 
 def test_backup_restore_and_structured_export_verify_cas_and_sqlite(tmp_path):
-    service = RuntimeService(tmp_path / "realm", display_name="Backup Realm")
+    service = _service(tmp_path / "realm", display_name="Backup Realm")
     try:
         project = service.create_project({"slug": "demo", "name": "Demo", "metadata": {"kind": "test"}})
         ingested = service.ingest(project["id"], b"backup-payload", media_type="text/plain", original_name="payload.txt", idempotency_key="backup-object")
@@ -194,7 +206,7 @@ def test_backup_restore_and_structured_export_verify_cas_and_sqlite(tmp_path):
 
 
 def test_restore_explicit_key_path_still_rejects_a_mismatched_key(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         backup = tmp_path / "backup"
         service.backup(backup)
@@ -207,7 +219,7 @@ def test_restore_explicit_key_path_still_rejects_a_mismatched_key(tmp_path):
 
 
 def test_http_admin_export_backup_and_restore_routes(tmp_path):
-    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    daemon = _daemon(tmp_path / "realm", tmp_path / "support")
     try:
         owner = Api(daemon.endpoint, daemon.token)
         exported = owner.request("GET", "/v1/export")
@@ -222,7 +234,7 @@ def test_http_admin_export_backup_and_restore_routes(tmp_path):
 
 
 def test_retry_is_state_guarded_and_records_transition(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1")})
         service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "runtime_epoch": service.health()["runtime_epoch"]}, idempotency_key="retry-worker-register")
@@ -242,7 +254,7 @@ def test_retry_is_state_guarded_and_records_transition(tmp_path):
 
 
 def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "effect", "name": "Effect"})
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1")})
@@ -282,7 +294,7 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
 
 
 def test_hc04_admission_rejects_unready_duplicate_and_foreign_inputs(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "owner", "name": "Owner"})
         foreign_project = service.create_project({"slug": "foreign", "name": "Foreign"})
@@ -325,7 +337,7 @@ def test_hc04_admission_rejects_unready_duplicate_and_foreign_inputs(tmp_path):
 
 
 def test_storage_admission_sets_exact_waiting_reason(tmp_path, monkeypatch):
-    service = RuntimeService(tmp_path / "realm")
+    service = _service(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.large", "definition_digest": _digest("render.large-v1"), "estimated_output_bytes": 1024})
         monkeypatch.setattr("runtime_protocol.store.shutil.disk_usage", lambda _path: SimpleNamespace(free=1))

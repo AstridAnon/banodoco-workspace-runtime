@@ -135,7 +135,6 @@ class BootstrapTests(unittest.TestCase):
         mode = stat.S_IMODE((self.paths.credentials_dir / "astrid.json").stat().st_mode)
         self.assertEqual(mode, 0o600)
         self.assertNotIn("activation_manifest", catalog["realms"][0])
-        self.assertEqual(tuple(self.paths.activations_dir.glob("*.json")), ())
         source_manifest = self.paths.source_profiles_dir / "astrid.json"
         self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
@@ -181,7 +180,7 @@ class BootstrapTests(unittest.TestCase):
         legacy.mkdir(parents=True)
         with self.assertRaises(LegacyRootCollisionError) as caught:
             bootstrap(self.paths, self.boundary, self.config)
-        self.assertIn("banodoco-local migrate --profile astrid --source", str(caught.exception))
+        self.assertIn("Legacy realm roots are unsupported", str(caught.exception))
         self.assertEqual(len(self.boundary.starts), 0)
         self.assertFalse(self.paths.catalog_path.exists())
 

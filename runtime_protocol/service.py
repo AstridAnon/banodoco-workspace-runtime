@@ -361,7 +361,7 @@ class RuntimeService:
         # Service startup is an open/admission operation.  Realm creation is
         # explicit through RealmStore.initialize; a missing path must fail
         # before schema, identity, lock, or storage roots can be created.
-        self.store = RealmStore(root_path, strict_admission=True)
+        self.store = RealmStore(root_path)
         self._verified = False
         self._admission_failure = None
         self._readiness_callback = None

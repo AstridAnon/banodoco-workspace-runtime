@@ -134,7 +134,7 @@ def main(argv=None):
         return 0
     if args.command == "export":
         # Export is an offline surface; share the same owner fence as startup
-        # instead of opening a second migration-capable connection.
+        # instead of opening a second connection with a different authority.
         store = RealmStore(args.root)
         try:
             value = structured_export(store)
@@ -167,7 +167,7 @@ def main(argv=None):
         raise
     except Exception as exc:
         # Installed operator entrypoints must fail as a stable JSON boundary;
-        # never leak a traceback for a missing migration or bad root.
+        # never leak a traceback for an unsupported format or bad root.
         error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
         print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1

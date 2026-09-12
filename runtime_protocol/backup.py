@@ -425,7 +425,7 @@ def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, k
                 if not isinstance(record, dict) or record.get("sha256") != actual_hash or int(record.get("size", -1)) != actual_size:
                     raise ConflictError("backup file digest mismatch", details={"file": name})
         elif format_version == 1:
-            raise ConflictError("legacy backup format requires explicit migration")
+            raise ConflictError("legacy backup format is unsupported; create a fresh canonical backup")
         else:
             raise ConflictError("unsupported backup format", details={"format_version": format_version})
         if manifest.get("database_sha256") != _sha256_at(backup_fd, "realm.sqlite3")[0]:
@@ -482,7 +482,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
         verified = verify_backup(source_backup, directory_identity=source_identity)
         source_manifest = verified["manifest"]
         if handoff.get("format_version") != 2:
-            raise ConflictError("legacy restore handoff requires explicit migration")
+            raise ConflictError("legacy restore handoff is unsupported; create a fresh canonical restore candidate")
         handoff_digest = handoff.get("handoff_sha256")
         handoff_mac = handoff.get("handoff_hmac")
         auth_key = _resolve_key(source_manifest)
@@ -790,10 +790,4 @@ def structured_export(store) -> dict:
     shot_items = rows("SELECT * FROM shot_items ORDER BY shot_id, sort_key, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
     text_bindings = rows("SELECT * FROM shot_text_bindings ORDER BY project_id, id")
     text_binding_events = rows("SELECT * FROM shot_text_binding_events ORDER BY project_id, binding_id, seq", lambda value: value | {"payload": json.loads(value.pop("payload_json"))})
-    # Canonical fresh realms deliberately contain no migration-owner ledger.
-    # Keep the export key stable for callers while leaving legacy import data
-    # outside the fresh-format foundation boundary.
-    owner_records = []
-    for record in owner_records:
-        record["row"] = json.loads(record.pop("row_json"))
-    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events, "migration_owner_records": owner_records}
+    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events}
