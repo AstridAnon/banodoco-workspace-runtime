@@ -408,7 +408,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             identity = self._identity("objects:write")
             key = self._idempotency_key()
             data = self._raw_body()
-            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity)
+            upload_binding = None
+            raw_binding = self.headers.get("X-Output-Binding")
+            if raw_binding:
+                try:
+                    upload_binding = json.loads(raw_binding)
+                except (TypeError, ValueError) as exc:
+                    raise ProtocolError("X-Output-Binding must contain valid JSON") from exc
+            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity, upload_binding=upload_binding)
             return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")

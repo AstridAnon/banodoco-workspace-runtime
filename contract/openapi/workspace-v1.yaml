@@ -429,7 +429,7 @@ paths:
   /v1/objects:
     post:
       operationId: ingestObject
-      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/OutputBinding' } ]
       requestBody:
         required: true
         content:
@@ -606,6 +606,7 @@ components:
     Cursor: { name: cursor, in: query, required: false, schema: { type: string, minLength: 1 } }
     Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+    OutputBinding: { name: X-Output-Binding, in: header, required: false, description: Canonical JSON attempt/upload provenance for worker-owned output bytes, schema: { type: string, minLength: 2, maxLength: 8192 } }
     ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
     ObjectId: { name: object_id, in: path, required: true, schema: { type: string } }
     TaskId: { name: task_id, in: path, required: true, schema: { type: string } }

@@ -88,6 +88,40 @@ def _settle_body(attempt: dict, outputs: list[dict]) -> dict:
     }
 
 
+def _upload_binding(
+    payload: bytes,
+    *,
+    attempt: dict,
+    project_id: str,
+    run_id: str,
+    executor_id: str,
+    output_key: str,
+    output_port: str,
+    filename: str,
+    media_type: str,
+) -> tuple[str, dict]:
+    binding = {
+        "project_id": project_id,
+        "run_id": run_id,
+        "task_id": attempt["task_id"],
+        "attempt_id": attempt["attempt_id"],
+        "executor_id": executor_id,
+        "lease_id": attempt["lease_id"],
+        "fence": attempt["fence"],
+        "runtime_epoch": attempt["runtime_epoch"],
+        "output_key": output_key,
+        "output_port": output_port,
+        "filename": filename,
+        "digest": _digest(payload),
+        "size": len(payload),
+        "media_type": media_type,
+    }
+    key = "output-" + hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    return key, binding
+
+
 def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path: Path) -> None:
     service = _new_service(tmp_path / "realm")
     try:
@@ -114,16 +148,28 @@ def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path:
                 media_type="application/zip",
             ),
         ]
-        for payload, media_type, filename in (
-            (manifest, "application/json", "filmstrip-manifest.json"),
-            (bundle, "application/zip", "filmstrip-bundle.zip"),
+        for payload, media_type, filename, output_key, output_port in (
+            (manifest, "application/json", "filmstrip-manifest.json", "filmstrip_manifest", "filmstrip_manifest"),
+            (bundle, "application/zip", "filmstrip-bundle.zip", "filmstrip_bundle", "filmstrip_bundle"),
         ):
+            key, binding = _upload_binding(
+                payload,
+                attempt=attempt,
+                project_id=project["id"],
+                run_id=_task["run"]["id"],
+                executor_id="filmstrip-worker",
+                output_key=output_key,
+                output_port=output_port,
+                filename=filename,
+                media_type=media_type,
+            )
             service.ingest_object(
                 payload,
                 media_type=media_type,
                 original_name=filename,
-                idempotency_key="output-" + hashlib.sha256(payload).hexdigest(),
+                idempotency_key=key,
                 identity=worker_identity,
+                upload_binding=binding,
             )
 
         service.settle_attempt(
@@ -136,6 +182,102 @@ def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path:
         assert service.task(_task["task"]["id"])["task"]["status"] == "completed"
         assert service.store.conn.execute(
             "SELECT COUNT(*) FROM project_objects WHERE project_id=?", (project["id"],)
+        ).fetchone()[0] == 2
+    finally:
+        service.close()
+
+
+def test_repeated_identical_output_bytes_bind_and_settle_for_two_live_attempts(tmp_path: Path) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "repeated", "name": "Repeated"})
+        definition = _digest(b"rendering.timeline_visualize-v1")
+        service.register_capability(
+            {"capability_id": "rendering.timeline_visualize", "definition_digest": definition}
+        )
+        identity = {"actor": "parallel-worker", "scopes": ["objects:write", "worker:execute"]}
+        service.register_executor(
+            {
+                "executor_id": "parallel-worker",
+                "capabilities": ["rendering.timeline_visualize"],
+                "max_concurrency": 2,
+            },
+            idempotency_key="parallel-worker-register",
+        )
+        tasks = [
+            service.create_task(
+                {
+                    "capability_id": "rendering.timeline_visualize",
+                    "capability_digest": definition,
+                    "project": project["id"],
+                    "idempotency_key": f"repeated-task-{index}",
+                }
+            )
+            for index in (1, 2)
+        ]
+        attempts = [
+            service.claim_next(
+                {
+                    "executor_id": "parallel-worker",
+                    "capability_ids": ["rendering.timeline_visualize"],
+                    "runtime_epoch": service.health()["runtime_epoch"],
+                },
+                idempotency_key=f"repeated-claim-{index}",
+                identity=identity,
+            )
+            for index in (1, 2)
+        ]
+        payload = b"the-same-successful-output"
+        output = _descriptor(
+            payload,
+            name="filmstrip_bundle",
+            filename="filmstrip-bundle.zip",
+            output_port="filmstrip_bundle",
+            primary=True,
+            media_type="application/zip",
+        )
+        upload_keys = []
+        for attempt in attempts:
+            key, binding = _upload_binding(
+                payload,
+                attempt=attempt,
+                project_id=project["id"],
+                run_id=service.task(attempt["task_id"])["run"]["id"],
+                executor_id="parallel-worker",
+                output_key="filmstrip_bundle",
+                output_port="filmstrip_bundle",
+                filename="filmstrip-bundle.zip",
+                media_type="application/zip",
+            )
+            service.ingest_object(
+                payload,
+                media_type="application/zip",
+                original_name="filmstrip-bundle.zip",
+                idempotency_key=key,
+                identity=identity,
+                upload_binding=binding,
+            )
+            upload_keys.append(key)
+        assert upload_keys[0] != upload_keys[1]
+        for index, attempt in enumerate(attempts, start=1):
+            service.settle_attempt(
+                attempt["attempt_id"],
+                _settle_body(attempt, [output]),
+                idempotency_key=f"repeated-settle-{index}",
+                identity=identity,
+            )
+
+        assert all(
+            service.task(attempt["task_id"])["task"]["status"] == "completed"
+            for attempt in attempts
+        )
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM objects WHERE digest=?",
+            (hashlib.sha256(payload).hexdigest(),),
+        ).fetchone()[0] == 1
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM managed_output_associations WHERE object_digest=?",
+            (hashlib.sha256(payload).hexdigest(),),
         ).fetchone()[0] == 2
     finally:
         service.close()
@@ -195,13 +337,24 @@ def test_recognized_output_receipt_is_bound_to_attempt_and_worker(tmp_path: Path
 
         payload = b"attempt-a-filmstrip-bundle"
         filename = "filmstrip-bundle.zip"
-        digest = hashlib.sha256(payload).hexdigest()
+        key, binding = _upload_binding(
+            payload,
+            attempt=attempts["worker-a"],
+            project_id=project["id"],
+            run_id=service.task(attempts["worker-a"]["task_id"])["run"]["id"],
+            executor_id="worker-a",
+            output_key="filmstrip_bundle",
+            output_port="filmstrip_bundle",
+            filename=filename,
+            media_type="application/zip",
+        )
         service.ingest_object(
             payload,
             media_type="application/zip",
             original_name=filename,
-            idempotency_key="output-" + digest,
+            idempotency_key=key,
             identity=workers["worker-a"],
+            upload_binding=binding,
         )
         attempts["worker-a-second"] = service.claim_next(
             {

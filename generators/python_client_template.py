@@ -897,10 +897,12 @@ class WorkspaceClient:
     def current_project(self) -> Mapping[str, Any]:
         return self._json(self._request("GET", "/v1/projects/selection")[2])
 
-    def ingest_object(self, data: bytes, *, media_type: str, idempotency_key: str, filename: str | None = None) -> MutationResult:
+    def ingest_object(self, data: bytes, *, media_type: str, idempotency_key: str, filename: str | None = None, upload_binding: Mapping[str, Any] | None = None) -> MutationResult:
         headers = {"Content-Type": media_type, "Idempotency-Key": idempotency_key}
         if filename:
             headers["X-Filename"] = filename
+        if upload_binding is not None:
+            headers["X-Output-Binding"] = json.dumps(upload_binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         _, _, body = self._request("POST", "/v1/objects", body=bytes(data), headers=headers, expected=(200, 201))
         return self._mutation_json(body)
 
