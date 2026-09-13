@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
+from banodoco_workspace_client import ApiError, WorkspaceClient  # noqa: E402
 from runtime_protocol.errors import ConflictError
+from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
@@ -115,3 +119,67 @@ def test_export_fails_closed_without_runtime_export_root(tmp_path: Path) -> None
             )
     finally:
         service.close()
+
+
+def test_generated_http_export_replay_conflict_and_durable_event(tmp_path: Path) -> None:
+    root = tmp_path / "realm"
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    first, association, task, payload, production_epoch = _settled_service(root, export_root)
+    first.close()
+    daemon = RuntimeDaemon(
+        root, support_root=tmp_path / "support", export_root=export_root, port=0,
+        production_worker_credentials=True,
+    ).start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        output = client.get_managed_output(association["association_id"])
+        result = client.export_managed_output(
+            output.association_id,
+            destination_filename=output.filename,
+            idempotency_key="http-export",
+            expected={"runtime_epoch": production_epoch, "digest": output.digest},
+        )
+        assert (export_root / output.filename).read_bytes() == payload
+        assert result["runtime_epoch"] == production_epoch
+        assert result.receipt["command_kind"] == "managed_output.export"
+
+        replay = client.export_managed_output(
+            output.association_id,
+            destination_filename=output.filename,
+            idempotency_key="http-export",
+            expected={"runtime_epoch": production_epoch, "digest": output.digest},
+        )
+        assert replay["export_id"] == result["export_id"]
+
+        with pytest.raises(ApiError) as changed:
+            client.export_managed_output(
+                output.association_id,
+                destination_filename=output.filename,
+                idempotency_key="http-export",
+                expected={"runtime_epoch": production_epoch, "size": output.size + 1},
+            )
+        assert changed.value.status == 409
+
+        with pytest.raises(ApiError) as overwrite:
+            client.export_managed_output(
+                output.association_id,
+                destination_filename=output.filename,
+                idempotency_key="http-export-overwrite",
+            )
+        assert overwrite.value.status == 409
+
+        with pytest.raises(ApiError) as unsafe_name:
+            client.export_managed_output(
+                output.association_id,
+                destination_filename=f"../{output.filename}",
+                idempotency_key="http-export-unsafe-name",
+            )
+        assert unsafe_name.value.status == 409
+
+        events, _ = client.list_run_events(task["run"]["id"])
+        exported_events = [event for event in events if event.event_type == "managed_output.exported"]
+        assert len(exported_events) == 1
+        assert exported_events[0].payload["export_id"] == result["export_id"]
+    finally:
+        daemon.stop()
