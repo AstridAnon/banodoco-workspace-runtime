@@ -3025,6 +3025,39 @@ class RuntimeService:
                 )
                 return result
 
+    def _is_authorized_generic_output(self, digest, size, media_type):
+        """Recognize the worker's unscoped output upload receipt.
+
+        Generic producers cannot create a project association during their
+        upload.  Settlement may adopt that exact object only when the
+        unscoped upload was recorded under the producer's deterministic
+        output idempotency key and its durable result matches the descriptor.
+        """
+        row = self.store.conn.execute(
+            "SELECT result_json FROM command_idempotency "
+            "WHERE command_kind='object.ingest' AND aggregate_id='objects' "
+            "AND idempotency_key=?",
+            ("output-" + digest,),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            result = json.loads(row["result_json"])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(result, dict):
+            return False
+        try:
+            recorded_size = int(result.get("size", -1))
+        except (TypeError, ValueError):
+            return False
+        return (
+            result.get("object_id") == "sha256:" + digest
+            and result.get("digest") == "sha256:" + digest
+            and recorded_size == int(size)
+            and result.get("media_type") == media_type
+        )
+
     def _stage_outputs(self, attempt_id, outputs, *, project_id=None):
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
@@ -3186,7 +3219,11 @@ class RuntimeService:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
                         raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
                     if project_id and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
-                        raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
+                        has_project_owner = self.store.conn.execute(
+                            "SELECT 1 FROM project_objects WHERE digest=? LIMIT 1", (digest,)
+                        ).fetchone()
+                        if has_project_owner or not self._is_authorized_generic_output(digest, size, media_type):
+                            raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 normalized = {
