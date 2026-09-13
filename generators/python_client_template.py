@@ -980,6 +980,11 @@ class WorkspaceClient:
     def get_managed_output(self, association_id: str) -> ManagedOutput:
         return ManagedOutput.from_json(self._json(self._request("GET", f"/v1/managed-outputs/{_path_part(association_id)}")[2]))
 
+    def export_managed_output(self, association_id: str, *, destination_filename: str, idempotency_key: str, expected: Mapping[str, Any] | None = None) -> MutationResult:
+        payload: dict[str, Any] = {"destination_filename": destination_filename}
+        if expected is not None: payload["expected"] = dict(expected)
+        return self._mutation_json(self._request("POST", f"/v1/managed-outputs/{_path_part(association_id)}/export", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def adopt_managed_output(self, association_id: str, *, idempotency_key: str, assertions: Mapping[str, Any] | None = None) -> MutationResult:
         payload = dict(assertions or {})
         _, _, body = self._request("POST", f"/v1/managed-outputs/{_path_part(association_id)}/adopt", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})

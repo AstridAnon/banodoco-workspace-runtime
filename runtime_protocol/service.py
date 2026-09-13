@@ -356,7 +356,7 @@ def _durable_mutation(function):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None):
         root_path = Path(root).expanduser().resolve()
         # Service startup is an open/admission operation.  Realm creation is
         # explicit through RealmStore.initialize; a missing path must fail
@@ -385,6 +385,12 @@ class RuntimeService:
             self.store.close()
             raise
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
+        self.export_root = Path(export_root).expanduser().resolve() if export_root else None
+        if self.export_root is not None:
+            if self.export_root == self.store.root or self.export_root.is_relative_to(self.store.root) or self.store.root.is_relative_to(self.export_root):
+                raise ValidationError("managed-output export root must be outside the active realm root")
+            if self.export_root.is_symlink() or not self.export_root.is_dir():
+                raise ValidationError("managed-output export root must be an existing ordinary directory")
         self.reboot_executor = reboot_executor
         configured_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
@@ -2495,6 +2501,147 @@ class RuntimeService:
     def managed_output(self, association_id):
         """Read one named managed association without exposing CAS or SQLite."""
         return self.store.get_managed_output(association_id)
+
+    def _export_source(self, association_id):
+        """Resolve one retained output and validate its historical fence facts."""
+        association = self.store.get_managed_output(association_id)
+        if association.get("durability") != "durable":
+            raise ConflictError("only durable managed outputs may be exported")
+        attempt = self.store.conn.execute(
+            "SELECT id, task_id, lease_id, fence, executor_id, runtime_epoch, settled FROM attempts WHERE id=?",
+            (str(association["attempt_id"]),),
+        ).fetchone()
+        if not attempt or str(attempt["task_id"]) != str(association["task_id"]):
+            raise ConflictError("managed output attempt provenance is unavailable")
+        if not int(attempt["settled"]):
+            raise ConflictError("managed output attempt is not completed")
+        run = self.store.conn.execute(
+            "SELECT id, project_id FROM runs WHERE id=?",
+            (str(association["run_id"]),),
+        ).fetchone()
+        if not run or run["project_id"] != association.get("project_id"):
+            raise ConflictError("managed output run/project provenance is inconsistent")
+        provenance = association.get("provenance") or {}
+        if not isinstance(provenance, dict):
+            raise ConflictError("managed output provenance is malformed")
+        for field, expected in (
+            ("task_id", association["task_id"]),
+            ("attempt_id", association["attempt_id"]),
+            ("executor_id", attempt["executor_id"]),
+            ("fence", int(attempt["fence"])),
+            ("runtime_epoch", int(attempt["runtime_epoch"])),
+        ):
+            if field in provenance and provenance[field] != expected:
+                raise ConflictError("managed output historical provenance is inconsistent", details={"field": field})
+        if not attempt["lease_id"] or not attempt["executor_id"] or int(attempt["fence"]) < 1 or int(attempt["runtime_epoch"]) < 1:
+            raise ConflictError("managed output attempt fence provenance is incomplete")
+        digest = str(association["digest"])
+        if not digest.startswith("sha256:"):
+            raise ConflictError("managed output digest is not canonical")
+        raw_digest = digest.removeprefix("sha256:")
+        object_row = self.store.conn.execute(
+            "SELECT size, media_type, original_name FROM objects WHERE digest=?",
+            (raw_digest,),
+        ).fetchone()
+        if not object_row:
+            raise ConflictError("managed output CAS object is unavailable")
+        data = self.cas.read(raw_digest)
+        if len(data) != int(association["size"]) or len(data) != int(object_row["size"]):
+            raise ConflictError("managed output CAS size does not match its association")
+        if str(object_row["media_type"]) != str(association["media_type"]):
+            raise ConflictError("managed output media type does not match its CAS object")
+        filename = str(association["filename"])
+        if not filename or filename in {".", ".."} or Path(filename).name != filename or "/" in filename or "\\" in filename:
+            raise ConflictError("managed output filename is not a direct safe file name")
+        return association, attempt, data
+
+    def _materialize_export(self, filename, data):
+        if self.export_root is None:
+            raise ConflictError("managed-output export root is not configured")
+        identity, root_fd, _ = _pin_directory(self.export_root)
+        temporary = f".{filename}.{os.getpid()}-{uuid.uuid4().hex}.tmp"
+        fd = -1
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=root_fd)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            try:
+                os.link(temporary, filename, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise ConflictError("managed-output export destination already exists") from exc
+            os.unlink(temporary, dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            _close_pinned(identity)
+
+    @_durable_mutation
+    def export_managed_output(self, association_id, body, *, idempotency_key=None):
+        """Materialize exact CAS bytes for one completed retained output."""
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = _wire_object(body, required=("destination_filename",), allowed=("destination_filename", "expected"))
+        destination_filename = _wire_string(body, "destination_filename")
+        expected = body.get("expected") or {}
+        if not isinstance(expected, dict):
+            raise ValidationError("expected export identity must be an object")
+        allowed_expected = {
+            "project_id", "run_id", "task_id", "attempt_id", "executor_id", "lease_id", "fence",
+            "runtime_epoch", "association_id", "output_port", "role", "object_id", "digest", "size",
+            "filename", "media_type",
+        }
+        unknown = sorted(set(expected) - allowed_expected)
+        if unknown:
+            raise ValidationError("expected export identity contains unsupported fields", details={"fields": unknown})
+        association, attempt, data = self._export_source(association_id)
+        if destination_filename != association["filename"]:
+            raise ConflictError("export destination filename must equal managed output filename")
+        source = {
+            "project_id": association.get("project_id"),
+            "run_id": association["run_id"], "task_id": association["task_id"],
+            "attempt_id": association["attempt_id"], "executor_id": attempt["executor_id"],
+            "lease_id": attempt["lease_id"], "fence": int(attempt["fence"]),
+            "runtime_epoch": int(attempt["runtime_epoch"]), "association_id": association["association_id"],
+            "output_port": association["output_port"], "role": association["role"],
+            "object_id": association["object_id"], "digest": association["digest"],
+            "size": int(association["size"]), "filename": association["filename"],
+            "media_type": association["media_type"],
+        }
+        for field, value in expected.items():
+            if value != source[field]:
+                raise ConflictError("export identity assertion does not match", details={"field": field})
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        project_id = association.get("project_id") or "unscoped"
+        replay = self._command_replay("managed_output.export", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        result = {
+            "export_id": "export-" + new_id(),
+            **source,
+            "producer": association.get("producer") or {},
+            "destination": {"root": str(self.export_root), "filename": destination_filename},
+            "source_provenance": association.get("provenance") or {},
+            "exported_at": now(),
+        }
+        self._materialize_export(destination_filename, data)
+        event_id = self.store._append_event(
+            association["run_id"], association["task_id"], "managed_output.exported", result,
+        )
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (association["run_id"],)).fetchone()[0]
+        return self._command_record(
+            "managed_output.export", str(association_id), idempotency_key, request_hash,
+            result, project_id=project_id, event_ids=(event_id,), primary_stream_id=association["run_id"],
+            resulting_stream_seq=event_seq,
+        )
 
     @_durable_mutation
     def adopt_managed_output(self, association_id, body=None, *, idempotency_key=None):

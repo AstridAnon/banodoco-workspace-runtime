@@ -20,6 +20,7 @@ def _parser():
     start = sub.add_parser("start", help="start the loopback daemon")
     start.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     start.add_argument("--support-root")
+    start.add_argument("--export-root", help="existing absolute directory for exact managed-output exports")
     start.add_argument("--host", default="127.0.0.1")
     start.add_argument("--port", type=int, default=0)
     start.add_argument("--display-name", default="Workspace")
@@ -164,7 +165,7 @@ def main(argv=None):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
-        daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True).start()
+        daemon = RuntimeDaemon(args.root, support_root=args.support_root, export_root=args.export_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True).start()
     except KeyboardInterrupt:
         raise
     except Exception as exc:
