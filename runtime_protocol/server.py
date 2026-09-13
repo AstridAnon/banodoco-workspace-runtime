@@ -483,6 +483,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if action == "adopt" and method == "POST":
                 self._identity("tasks:write")
                 return self._send(200, self.runtime.adopt_managed_output(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            if action == "export" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.export_managed_output(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
             if action == "lifecycle" and method == "POST":
                 self._identity("tasks:write")
                 return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))

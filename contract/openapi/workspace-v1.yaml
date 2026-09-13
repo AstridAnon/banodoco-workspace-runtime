@@ -159,6 +159,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputAdoption' } } } }
       responses: { '200': { description: Named managed association adoption with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/export:
+    post:
+      operationId: exportManagedOutput
+      description: Materialize exact bytes for one completed durable managed output under the Runtime-configured authorized export root and record its historical provenance.
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputExportRequest' } } } }
+      responses: { '200': { description: Exact managed-output export with committed provenance receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/managed-outputs/{association_id}/lifecycle:
     post:
       operationId: updateManagedOutputLifecycle
@@ -785,6 +792,13 @@ components:
         ordinal: { type: integer, minimum: 0 }
         role: { type: string, minLength: 1 }
         durability: { type: string, enum: [durable, temporary] }
+    ManagedOutputExportRequest:
+      type: object
+      additionalProperties: false
+      required: [destination_filename]
+      properties:
+        destination_filename: { type: string, minLength: 1, maxLength: 512 }
+        expected: { type: object, additionalProperties: true }
     ManagedOutputLifecycle:
       type: object
       additionalProperties: false
