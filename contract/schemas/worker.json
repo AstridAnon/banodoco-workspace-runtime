@@ -94,7 +94,7 @@
       "required": ["task", "waiting_reason"],
       "properties": {
         "task": { "$ref": "./task.json" },
-        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts"] }
+        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled"] }
       }
     },
     "Settlement": {
@@ -131,7 +131,8 @@
         "variant_key": { "type": "string" },
         "generation_id": { "type": ["string", "null"] },
         "ordinal": { "type": "integer", "minimum": 0 },
-        "role": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "is_primary": { "type": "boolean" },
         "durability": { "type": "string", "enum": ["durable", "temporary"] },
         "producer": { "type": "object" },
         "provenance": { "type": "object" },
