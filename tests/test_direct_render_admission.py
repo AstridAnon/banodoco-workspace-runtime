@@ -46,6 +46,7 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
             "capability_digest": capability_digest,
             "input_object_ids": [source_id],
             "idempotency_key": "render",
+            "storage_estimate": {"scratch_bytes": 0, "output_bytes": 0},
             "spec": {
                 "family": "render",
                 "params": {
@@ -63,11 +64,14 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
             "registry": timeline["registry"],
         }
         assert admitted_spec["inputs"]["timeline_ref"] == "main"
+        assert admitted_spec["inputs"]["selector"] == "rendering.remotion"
         assert admitted_spec["inputs"]["timeline_authority"]["project_id"] == project["id"]
         assert admitted_spec["inputs"]["timeline_authority"]["project_slug"] == "managed-render"
         assert admitted_spec["inputs"]["timeline_authority"]["config_version"] == 1
         assert admitted_spec["inputs"]["timeline_authority"]["managed_media_admissions"] == {"media-source": source_id}
         assert task["spec"]["input_object_ids"] == [source_id]
+        assert task["spec"]["storage_estimate"]["scratch_bytes"] >= 256 * 1024 * 1024
+        assert task["spec"]["storage_estimate"]["output_bytes"] >= 1024 * 1024
 
         epoch = service.health()["runtime_epoch"]
         claimed = service.claim_next({
@@ -78,6 +82,7 @@ def test_direct_managed_render_admission_freezes_snapshot_before_claim(tmp_path)
         assert claimed["spec"]["spec"]["timeline_snapshot"] == admitted_spec["timeline_snapshot"]
         assert claimed["spec"]["spec"]["inputs"]["timeline_authority"] == admitted_spec["inputs"]["timeline_authority"]
         assert claimed["input_object_ids"] == [source_id]
+        assert claimed["storage_estimate"] == task["spec"]["storage_estimate"]
     finally:
         service.close()
 
@@ -102,6 +107,14 @@ def test_direct_managed_render_rejects_stale_scope_and_path_injection(tmp_path):
         }
         with pytest.raises(ConflictError, match="expected_version"):
             service.create_task(body)
+
+        understated = {
+            **body,
+            "spec": {"params": {"timeline_ref": "main"}},
+            "storage_estimate": {"scratch_bytes": 1, "output_bytes": 1},
+        }
+        with pytest.raises(ConflictError, match="understates"):
+            service.create_task(understated)
 
         for field, message in (
             ("timeline", "caller-supplied timeline path"),

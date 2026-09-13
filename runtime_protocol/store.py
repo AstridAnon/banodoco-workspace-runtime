@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import sqlite3
@@ -919,6 +920,12 @@ class RealmStore:
             or supplied_version < 1
         ):
             raise ValidationError("render expected_version must be a positive integer")
+        selector = params.get("selector")
+        if selector is not None and (not isinstance(selector, str) or not selector.strip()):
+            raise ValidationError("render selector must be a non-empty string")
+        output_policy = params.get("output_policy")
+        if output_policy is not None and not isinstance(output_policy, dict):
+            raise ValidationError("render output_policy must be an object")
 
         rows = self.conn.execute(
             "SELECT id, archived_at FROM timelines WHERE project_id=? ORDER BY created_at, id",
@@ -1025,7 +1032,132 @@ class RealmStore:
         frozen["timeline_snapshot"] = {"config": config, "registry": registry}
         inputs["timeline_ref"] = timeline_ref
         inputs["timeline_authority"] = authority
+        for field in ("selector", "profile", "output_name"):
+            if field in params:
+                if field in inputs and inputs[field] != params[field]:
+                    raise ConflictError(f"render {field} bindings conflict")
+                inputs[field] = params[field]
         return frozen, ordered_input_ids
+
+    def _derive_managed_render_storage_estimate(self, config, registry, ordered_input_ids, profile=None):
+        """Derive a conservative whole-task budget from Runtime-owned inputs.
+
+        This is deliberately engine-neutral.  Runtime owns the exact CAS
+        object sizes and the immutable snapshot bytes; renderer-specific
+        profile validation remains a host concern, but the admission budget
+        must still cover the host's attempt-local materialization before a
+        worker can claim the task.
+        """
+        if profile is not None and not isinstance(profile, dict):
+            raise ValidationError("render profile must be an object")
+        profile = profile or {}
+        if profile:
+            required_profile = {
+                "width", "height", "fps_rational", "time_base", "container",
+                "video_codec", "video_profile", "video_level", "pixel_format",
+                "duration_tolerance",
+            }
+            optional_profile = {"audio_codec", "audio_sample_rate", "audio_channel_layout"}
+            unknown = set(profile) - required_profile - optional_profile
+            missing = required_profile - set(profile)
+            if unknown or missing:
+                raise ValidationError(
+                    "render profile has invalid fields",
+                    details={"missing": sorted(missing), "unknown": sorted(unknown)},
+                )
+            audio_fields = optional_profile.intersection(profile)
+            if audio_fields and audio_fields != optional_profile:
+                raise ValidationError("render profile audio fields must be supplied together")
+            for field in ("container", "video_codec", "pixel_format"):
+                if not isinstance(profile[field], str) or not profile[field]:
+                    raise ValidationError(f"render profile {field} must be a non-empty string")
+            if isinstance(profile["duration_tolerance"], bool) or not isinstance(profile["duration_tolerance"], int) or profile["duration_tolerance"] < 0:
+                raise ValidationError("render profile duration_tolerance must be a non-negative integer")
+        width = profile.get("width", 1920)
+        height = profile.get("height", 1080)
+        if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+            raise ValidationError("render profile width must be a positive integer")
+        if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+            raise ValidationError("render profile height must be a positive integer")
+        fps_rational = profile.get("fps_rational", [30, 1])
+        if (
+            not isinstance(fps_rational, list)
+            or len(fps_rational) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in fps_rational)
+        ):
+            raise ValidationError("render profile fps_rational must be [positive numerator, positive denominator]")
+        if profile:
+            time_base = profile.get("time_base")
+            if (
+                not isinstance(time_base, list)
+                or len(time_base) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in time_base)
+            ):
+                raise ValidationError("render profile time_base must be [positive numerator, positive denominator]")
+        fps = fps_rational[0] / fps_rational[1]
+        canvas = ((config.get("theme_overrides") or {}).get("visual") or {}).get("canvas", {})
+        if not profile:
+            if isinstance(canvas, dict):
+                width = canvas.get("width", width)
+                height = canvas.get("height", height)
+                raw_fps = canvas.get("fps", fps)
+                if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+                    raise ValidationError("canonical timeline canvas width must be a positive integer")
+                if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+                    raise ValidationError("canonical timeline canvas height must be a positive integer")
+                if isinstance(raw_fps, (int, float)) and raw_fps > 0:
+                    fps = float(raw_fps)
+
+        object_sizes = {}
+        for object_id in ordered_input_ids:
+            digest = OBJECT_ID_RE.fullmatch(object_id).group(1)
+            row = self.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+            if not row:
+                raise ConflictError(
+                    "canonical timeline media object is not available in Runtime CAS",
+                    details={"object_id": object_id},
+                )
+            object_sizes[digest] = int(row["size"])
+        managed_input_bytes = sum(object_sizes.values())
+        assets = registry.get("assets", {}) if isinstance(registry, dict) else {}
+        managed_entry_bytes = 0
+        for asset in assets.values() if isinstance(assets, dict) else ():
+            if not isinstance(asset, dict):
+                continue
+            digest = next((value for key in ("content_sha256", "object_id", "digest", "sha256", "hash") if isinstance((value := asset.get(key)), str) and OBJECT_ID_RE.fullmatch(value)), None)
+            if digest is not None:
+                managed_entry_bytes += object_sizes[OBJECT_ID_RE.fullmatch(digest).group(1)]
+        snapshot_bytes = len(canonical_json(config).encode()) + len(canonical_json(registry).encode())
+        duration_seconds = 1.0
+        clips = config.get("clips", []) if isinstance(config, dict) else []
+        if isinstance(clips, list):
+            for clip in clips:
+                if not isinstance(clip, dict):
+                    continue
+                at = clip.get("at", clip.get("start", 0))
+                duration = clip.get("duration", clip.get("hold", 0))
+                end = clip.get("to", clip.get("end"))
+                candidates = []
+                if isinstance(end, (int, float)):
+                    candidates.append(float(end))
+                if isinstance(at, (int, float)) and isinstance(duration, (int, float)):
+                    candidates.append(float(at) + max(0.0, float(duration)))
+                if candidates:
+                    duration_seconds = max(duration_seconds, max(candidates))
+        duration_seconds = min(max(duration_seconds, 1.0), 24 * 60 * 60)
+        video_bitrate = max(4_000_000, math.ceil(width * height * fps / 4 / 1000) * 1000)
+        encoded_payload = math.ceil(duration_seconds * (video_bitrate + 320_000) / 8)
+        output_bytes = max(1024 * 1024, math.ceil(encoded_payload * 1.03) + 1024 * 1024)
+        materialization_bytes = (
+            managed_input_bytes
+            + (managed_entry_bytes * 2)
+            + (snapshot_bytes * 2)
+        )
+        scratch_bytes = max(
+            256 * 1024 * 1024,
+            materialization_bytes + output_bytes + 2 * 1024 * 1024,
+        )
+        return {"scratch_bytes": int(scratch_bytes), "output_bytes": int(output_bytes)}
 
     @staticmethod
     def _validate_storage_estimate(storage_estimate):
@@ -1082,6 +1214,27 @@ class RealmStore:
                 spec = dict(spec)
                 spec["spec"] = admitted_spec
                 spec["input_object_ids"] = frozen_inputs
+                if isinstance(admitted_spec, dict) and isinstance(admitted_spec.get("timeline_snapshot"), dict):
+                    admitted_inputs = admitted_spec.get("inputs", {})
+                    profile = admitted_inputs.get("profile") if isinstance(admitted_inputs, dict) else None
+                    derived_storage = self._derive_managed_render_storage_estimate(
+                        admitted_spec["timeline_snapshot"]["config"],
+                        admitted_spec["timeline_snapshot"]["registry"],
+                        frozen_inputs,
+                        profile=profile,
+                    )
+                    supplied_storage = spec.get("storage_estimate")
+                    if supplied_storage is not None:
+                        supplied_storage = self._validate_storage_estimate(supplied_storage)
+                        if supplied_storage["scratch_bytes"] or supplied_storage["output_bytes"]:
+                            if any(supplied_storage[key] < derived_storage[key] for key in ("scratch_bytes", "output_bytes")):
+                                raise ConflictError(
+                                    "render storage_estimate understates the Runtime-owned canonical render budget",
+                                    details={"required": derived_storage, "actual": supplied_storage},
+                                )
+                            derived_storage = supplied_storage
+                    admitted_spec["inputs"]["timeline_authority"]["storage_estimate"] = derived_storage
+                    spec["storage_estimate"] = derived_storage
             predecessors = self._continuation_predecessors(spec)
             if isinstance(expected_effect, dict) and expected_effect.get("effect_type") == "generation.publish_v1":
                 # The typed GEN publication plan is admitted against the task
