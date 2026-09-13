@@ -3,6 +3,7 @@ import json
 import pytest
 
 import runtime_protocol.backup as backup_module
+import runtime_protocol.store as store_module
 from runtime_protocol.backup import verify_backup
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
@@ -32,6 +33,34 @@ def test_fresh_creation_interruption_leaves_no_partial_final_root(tmp_path, monk
         RealmStore.initialize(root)
     assert not root.exists()
     assert not list(tmp_path.glob(".realm.create-*"))
+
+
+def test_fresh_creation_post_rename_fsync_rolls_back_and_is_retryable(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    original_fsync = store_module.os.fsync
+    injected = False
+
+    def interrupt_after_publication(fd):
+        nonlocal injected
+        if root.exists() and not injected:
+            injected = True
+            raise OSError("injected parent fsync interruption")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(store_module.os, "fsync", interrupt_after_publication)
+    with pytest.raises(OSError, match="parent fsync interruption"):
+        RealmStore.initialize(root)
+    assert injected
+    assert not root.exists()
+    assert not list(tmp_path.glob(".realm.create-*"))
+
+    monkeypatch.setattr(store_module.os, "fsync", original_fsync)
+    retry = RealmStore.initialize(root, realm_id="retry-realm", display_name="Retry Realm")
+    try:
+        assert retry.realm["id"] == "retry-realm"
+        assert retry.realm["display_name"] == "Retry Realm"
+    finally:
+        retry.close()
 
 
 def test_backup_candidate_is_verified_before_publication(tmp_path, monkeypatch):
