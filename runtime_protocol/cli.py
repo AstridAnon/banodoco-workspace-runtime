@@ -123,11 +123,11 @@ def main(argv=None):
         return 0
     if args.command == "replace":
         root = Path(args.root).expanduser().resolve()
-        candidate = root.parent / f".{root.name}.candidate-{os.getpid()}-{time.time_ns()}"
-        daemon = RuntimeDaemon(root, support_root=args.support_root, display_name=args.display_name, realm_id=args.realm_id, production_worker_credentials=True).start()
+        daemon = RuntimeDaemon(root, support_root=args.support_root, display_name=args.display_name, realm_id=args.realm_id, production_worker_credentials=True)
         try:
-            daemon.service.restore(args.backup, candidate)
-            result = daemon.activate_candidate(candidate)
+            # Replacement is coordinated offline so a damaged active root is
+            # never admitted merely to reach the recovery command.
+            result = daemon.replace_from_backup(args.backup)
         finally:
             daemon.stop()
         print(json.dumps(result, sort_keys=True))

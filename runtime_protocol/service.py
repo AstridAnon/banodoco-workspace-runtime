@@ -356,7 +356,7 @@ def _durable_mutation(function):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None):
         root_path = Path(root).expanduser().resolve()
         # Service startup is an open/admission operation.  Realm creation is
         # explicit through RealmStore.initialize; a missing path must fail
@@ -377,7 +377,9 @@ class RuntimeService:
             if not report.get("ok"):
                 raise RealmAdmissionError("realm is not usable after initialization", details=report)
             self.runtime_session_id = new_id()
-            self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+            self._runtime_state = self.store.begin_runtime_session(
+                self.runtime_session_id, epoch_floor=runtime_epoch_floor
+            )
             self._verified = True
         except Exception:
             self.store.close()
