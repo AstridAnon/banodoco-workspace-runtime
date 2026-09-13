@@ -8,6 +8,7 @@ import pytest
 
 from runtime_protocol.errors import ConflictError, LeaseError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 CHILD_CAPABILITY = "test.child"
@@ -122,7 +123,9 @@ def _event_pages(service: RuntimeService, run_id: str):
 
 
 def test_out_of_order_completion_admits_once_in_declared_order_and_paginates(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         project_id, continuation_digest = _setup(service)
         first = _child(service, project_id, "child-first")
@@ -164,6 +167,7 @@ def test_out_of_order_completion_admits_once_in_declared_order_and_paginates(tmp
 
 def test_replay_conflict_and_restart_at_continuation_admission(tmp_path):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     service = RuntimeService(root)
     project_id, continuation_digest = _setup(service, "restart")
     first = _child(service, project_id, "restart-first")
@@ -216,7 +220,9 @@ def test_replay_conflict_and_restart_at_continuation_admission(tmp_path):
 
 
 def test_failure_cancel_selected_retry_and_stale_settlement(tmp_path):
-    service = RuntimeService(tmp_path / "realm")
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
     try:
         project_id, continuation_digest = _setup(service, "retry")
         first = _child(service, project_id, "retry-first")
