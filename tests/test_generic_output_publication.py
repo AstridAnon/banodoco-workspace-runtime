@@ -93,6 +93,7 @@ def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path:
     try:
         project = service.create_project({"slug": "filmstrip", "name": "Filmstrip"})
         _task, attempt = _filmstrip_attempt(service, project["id"])
+        worker_identity = {"actor": "filmstrip-worker", "scopes": ["objects:write", "worker:execute"]}
         manifest = b'{"kind":"timeline_filmstrip_result"}'
         bundle = _zip_payload()
         outputs = [
@@ -113,23 +114,138 @@ def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path:
                 media_type="application/zip",
             ),
         ]
-        for payload, media_type in ((manifest, "application/json"), (bundle, "application/zip")):
+        for payload, media_type, filename in (
+            (manifest, "application/json", "filmstrip-manifest.json"),
+            (bundle, "application/zip", "filmstrip-bundle.zip"),
+        ):
             service.ingest_object(
                 payload,
                 media_type=media_type,
+                original_name=filename,
                 idempotency_key="output-" + hashlib.sha256(payload).hexdigest(),
+                identity=worker_identity,
             )
 
         service.settle_attempt(
             attempt["attempt_id"],
             _settle_body(attempt, outputs),
             idempotency_key="filmstrip-settle",
+            identity=worker_identity,
         )
 
         assert service.task(_task["task"]["id"])["task"]["status"] == "completed"
         assert service.store.conn.execute(
             "SELECT COUNT(*) FROM project_objects WHERE project_id=?", (project["id"],)
         ).fetchone()[0] == 2
+    finally:
+        service.close()
+
+
+def test_recognized_output_receipt_is_bound_to_attempt_and_worker(tmp_path: Path) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "bound", "name": "Bound"})
+        definition = _digest(b"rendering.timeline_visualize-v1")
+        service.register_capability(
+            {"capability_id": "rendering.timeline_visualize", "definition_digest": definition}
+        )
+        workers = {
+            "worker-a": {"actor": "worker-a", "scopes": ["objects:write", "worker:execute"]},
+            "worker-b": {"actor": "worker-b", "scopes": ["objects:write", "worker:execute"]},
+        }
+        for executor_id in workers:
+            service.register_executor(
+                {
+                    "executor_id": executor_id,
+                    "capabilities": ["rendering.timeline_visualize"],
+                    "max_concurrency": 2 if executor_id == "worker-a" else 1,
+                },
+                idempotency_key=f"{executor_id}-register",
+            )
+        tasks = {
+            executor_id: service.create_task(
+                {
+                    "capability_id": "rendering.timeline_visualize",
+                    "capability_digest": definition,
+                    "project": project["id"],
+                    "idempotency_key": f"bound-task-{executor_id}",
+                }
+            )
+            for executor_id in workers
+        }
+        tasks["worker-a-second"] = service.create_task(
+            {
+                "capability_id": "rendering.timeline_visualize",
+                "capability_digest": definition,
+                "project": project["id"],
+                "idempotency_key": "bound-task-worker-a-second",
+            }
+        )
+        attempts = {}
+        for executor_id in workers:
+            attempts[executor_id] = service.claim_next(
+                {
+                    "executor_id": executor_id,
+                    "capability_ids": ["rendering.timeline_visualize"],
+                    "runtime_epoch": service.health()["runtime_epoch"],
+                },
+                idempotency_key=f"{executor_id}-claim",
+                identity=workers[executor_id],
+            )
+
+        payload = b"attempt-a-filmstrip-bundle"
+        filename = "filmstrip-bundle.zip"
+        digest = hashlib.sha256(payload).hexdigest()
+        service.ingest_object(
+            payload,
+            media_type="application/zip",
+            original_name=filename,
+            idempotency_key="output-" + digest,
+            identity=workers["worker-a"],
+        )
+        attempts["worker-a-second"] = service.claim_next(
+            {
+                "executor_id": "worker-a",
+                "capability_ids": ["rendering.timeline_visualize"],
+                "runtime_epoch": service.health()["runtime_epoch"],
+            },
+            idempotency_key="worker-a-second-claim",
+            identity=workers["worker-a"],
+        )
+        output = _descriptor(
+            payload,
+            name="filmstrip_bundle",
+            filename=filename,
+            output_port="filmstrip_bundle",
+            primary=True,
+            media_type="application/zip",
+        )
+
+        with pytest.raises(ConflictError, match="outside the task project"):
+            service.settle_attempt(
+                attempts["worker-b"]["attempt_id"],
+                _settle_body(attempts["worker-b"], [output]),
+                idempotency_key="wrong-worker-settle",
+                identity=workers["worker-b"],
+            )
+        assert service.task(attempts["worker-b"]["task_id"])["task"]["status"] == "running"
+
+        with pytest.raises(ConflictError, match="outside the task project"):
+            service.settle_attempt(
+                attempts["worker-a-second"]["attempt_id"],
+                _settle_body(attempts["worker-a-second"], [output]),
+                idempotency_key="wrong-attempt-settle",
+                identity=workers["worker-a"],
+            )
+        assert service.task(attempts["worker-a-second"]["task_id"])["task"]["status"] == "running"
+
+        service.settle_attempt(
+            attempts["worker-a"]["attempt_id"],
+            _settle_body(attempts["worker-a"], [output]),
+            idempotency_key="right-worker-settle",
+            identity=workers["worker-a"],
+        )
+        assert service.task(attempts["worker-a"]["task_id"])["task"]["status"] == "completed"
     finally:
         service.close()
 
