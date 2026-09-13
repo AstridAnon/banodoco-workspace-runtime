@@ -36,6 +36,7 @@ def _parser():
     doctor.add_argument("--support-root")
     backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
     backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    backup.add_argument("--support-root")
     backup.add_argument("--destination", required=True)
     restore = sub.add_parser("restore", help="restore a backup into a new inactive realm")
     restore.add_argument("--backup", required=True)
@@ -112,7 +113,8 @@ def main(argv=None):
         # offline surface and must acquire that same realm-owner fence.
         store = RealmStore(args.root)
         try:
-            result = create_backup(store, args.destination)
+            key_path = (Path(args.support_root).expanduser().resolve() / "backup-auth.key") if args.support_root else None
+            result = create_backup(store, args.destination, key_path=key_path)
         finally:
             store.close()
         print(json.dumps(result, sort_keys=True))

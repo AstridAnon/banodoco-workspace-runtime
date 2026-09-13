@@ -23,12 +23,20 @@ python3 -m runtime_protocol create --root .runtime
 python3 -m runtime_protocol start --root .runtime
 ```
 
-Backups are verified before publication into a new inactive sibling. An operator
-can restore and activate one through the Runtime boundary:
+Backups are verified before publication into a new inactive sibling. Replacement
+requires support custody outside the movable realm root; the default in-root
+`root/support` layout remains valid for ordinary startup but is rejected before
+replacement moves. Use one stable sibling support directory for the daemon,
+backup authentication key, credentials, epoch floor, and catalog:
 
 ```bash
-python3 -m runtime_protocol backup --root .runtime --destination ./realm-backup
-python3 -m runtime_protocol replace --root .runtime --backup ./realm-backup
+python3 -m runtime_protocol create --root ./runtime-realm
+python3 -m runtime_protocol start --root ./runtime-realm --support-root ./runtime-support
+# Stop the daemon before using the offline CLI backup command.
+python3 -m runtime_protocol backup --root ./runtime-realm \
+  --support-root ./runtime-support --destination ./realm-backup
+python3 -m runtime_protocol replace --root ./runtime-realm \
+  --support-root ./runtime-support --backup ./realm-backup
 ```
 
 Replacement retains the superseded root for recovery evidence, rotates the
