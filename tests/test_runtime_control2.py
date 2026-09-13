@@ -191,12 +191,12 @@ def test_backup_restore_and_structured_export_verify_cas_and_sqlite(tmp_path):
 
         backup = tmp_path / "backup"
         result = service.backup(backup)
-        assert result["manifest"]["realm_id"] == service.realm["id"]
+        assert result["manifest"]["realm"]["id"] == service.realm["id"]
         assert (backup / "cas-manifest.json").is_file()
         verify_backup(backup)
 
         restored = service.restore(backup, tmp_path / "restored")
-        assert restored["verification"]["realm_id"] == service.realm["id"]
+        assert restored["verification"]["realm"]["id"] == service.realm["id"]
         handoff = json.loads((tmp_path / "restored" / "activation-handoff.json").read_text())
         assert handoff["state"] == "prepared"
         with pytest.raises(ConflictError):
@@ -226,7 +226,7 @@ def test_http_admin_export_backup_and_restore_routes(tmp_path):
         assert exported["realm"]["id"] == daemon.service.realm["id"]
         backup = tmp_path / "http-backup"
         created = owner.request("POST", "/v1/backup", {"destination": str(backup)})
-        assert created["manifest"]["realm_id"] == daemon.service.realm["id"]
+        assert created["manifest"]["realm"]["id"] == daemon.service.realm["id"]
         restored = owner.request("POST", "/v1/restore", {"backup": str(backup), "destination": str(tmp_path / "http-restored")})
         assert restored["activation_handoff"].endswith("activation-handoff.json")
     finally:

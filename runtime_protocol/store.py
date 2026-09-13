@@ -188,20 +188,29 @@ class RealmStore:
         an admission failure rather than an implicit bootstrap.
         """
         root = Path(root).expanduser().resolve()
+        # Validate the complete identity before touching the requested root.
+        # Creation is a sibling build followed by one directory publication;
+        # the final name must never expose the schema without its identity.
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValidationError("fresh realm identity is invalid")
+        rid = str(realm_id or new_id())
+        if not rid.strip():
+            raise ValidationError("fresh realm identity is invalid")
         if root.exists():
             if root.is_symlink() or not root.is_dir():
                 raise RealmAdmissionError("fresh realm root is not a directory")
             if any(root.iterdir()):
                 raise RealmAdmissionError("fresh realm root must be absent or empty")
         else:
-            root.mkdir(parents=True, exist_ok=False)
-            root.chmod(0o700)
+            root.parent.mkdir(parents=True, exist_ok=True)
+        staged_root = Path(tempfile.mkdtemp(prefix=f".{root.name}.create-", dir=str(root.parent)))
+        staged_root.chmod(0o700)
         store = cls.__new__(cls)
-        store.root = root
-        store.lock_path = root / "owner.lock"
-        store.db_path = root / "realm.sqlite3"
-        store.cas_root = root / "cas" / "sha256"
-        store.staging_root = root / "staging"
+        store.root = staged_root
+        store.lock_path = staged_root / "owner.lock"
+        store.db_path = staged_root / "realm.sqlite3"
+        store.cas_root = staged_root / "cas" / "sha256"
+        store.staging_root = staged_root / "staging"
         store._lock_file = None
         store._mutex = threading.RLock()
         store.conn = None
@@ -209,9 +218,6 @@ class RealmStore:
             store._acquire_owner()
             store._open(fresh=True)
             timestamp = now()
-            rid = str(realm_id or new_id())
-            if not rid.strip() or not isinstance(display_name, str) or not display_name.strip():
-                raise ValidationError("fresh realm identity is invalid")
             with store._transaction():
                 store.conn.execute(
                     "INSERT INTO realm(id, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -224,9 +230,25 @@ class RealmStore:
             store.admission_report = store.integrity_report()
             if not store.admission_report.get("ok"):
                 raise RealmAdmissionError("fresh realm failed canonical admission", details=store.admission_report)
-            return store
+            store.close()
+            staged_fd = os.open(staged_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(staged_fd)
+            finally:
+                os.close(staged_fd)
+            parent_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.rename(staged_root.name, root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            # Reopen only after the complete staged tree is published.  This
+            # also returns paths rooted at the public final name.
+            return cls(root)
         except Exception:
             store.close()
+            if staged_root.exists() and staged_root != root:
+                shutil.rmtree(staged_root, ignore_errors=True)
             raise
 
     def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS):
@@ -472,7 +494,7 @@ class RealmStore:
         settlements_root.chmod(0o700)
         return settlements_root / attempt_id
 
-    def begin_runtime_session(self, boot_id):
+    def begin_runtime_session(self, boot_id, *, epoch_floor: int | None = None):
         """Open a durable boot session and recover work owned by old boots.
 
         The monotonically increasing epoch lives in SQLite and is advanced
@@ -487,7 +509,14 @@ class RealmStore:
                 row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
                 previous_epoch = int(row["runtime_epoch"]) if row else 0
                 previous_boot = row["boot_id"] if row else None
-                epoch = previous_epoch + 1
+                if epoch_floor is not None:
+                    try:
+                        epoch_floor = int(epoch_floor)
+                    except (TypeError, ValueError) as exc:
+                        raise ValidationError("runtime epoch floor is invalid") from exc
+                    if epoch_floor < 0:
+                        raise ValidationError("runtime epoch floor must be non-negative")
+                epoch = max(previous_epoch, int(epoch_floor or 0)) + 1
                 started_at = now()
                 self.conn.execute(
                     "INSERT INTO runtime_lifecycle(id, runtime_epoch, boot_id, previous_boot_id, started_at, recovered_task_count) VALUES (1, ?, ?, ?, ?, 0) ON CONFLICT(id) DO UPDATE SET runtime_epoch=excluded.runtime_epoch, boot_id=excluded.boot_id, previous_boot_id=excluded.previous_boot_id, started_at=excluded.started_at, recovered_task_count=0",

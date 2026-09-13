@@ -51,7 +51,9 @@ def test_runtime_backup_last_rename_is_parent_pinned(tmp_path, monkeypatch, mode
         with pytest.raises(ConflictError, match="identity|symlink|parent"):
             active.backup(parent / "backup")
         swapped, real_parent = state()
-        assert swapped and (real_parent / "backup").is_dir()
+        # Publication interruption is fail-closed: the pinned old parent may
+        # have received the rename, but no accepted final backup remains.
+        assert swapped and not (real_parent / "backup").exists()
         assert not any(outside.iterdir())
         assert active.health()["status"] == "ok"
     finally:
