@@ -6,6 +6,7 @@ import multiprocessing
 import pytest
 
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.server import RuntimeHandler, RuntimeHTTPServer
 from runtime_protocol.store import RealmStore
 from runtime_protocol.catalog import RealmCatalog
 from runtime_protocol.errors import ConflictError
@@ -85,6 +86,43 @@ def test_failed_replacement_rolls_back_and_leaves_recoverable_state(tmp_path, mo
         assert any(path.name.startswith(".active.superseded-") for path in tmp_path.iterdir()) is False
     finally:
         daemon.stop()
+
+
+def test_in_root_default_support_is_rejected_before_replacement_moves(tmp_path):
+    active_root = tmp_path / "active"
+    _fresh(active_root)
+    daemon = RuntimeDaemon(active_root, production_worker_credentials=True).start()
+    backup = tmp_path / "backup"
+    candidate = tmp_path / "candidate"
+    try:
+        daemon.service.backup(backup)
+        daemon.service.restore(backup, candidate)
+        with pytest.raises(ConflictError, match="support_root outside the active realm root"):
+            daemon.activate_candidate(candidate)
+        assert active_root.is_dir()
+        assert candidate.is_dir()
+        assert daemon.service.health()["status"] == "ok"
+    finally:
+        daemon.stop()
+
+    offline = RuntimeDaemon(active_root, production_worker_credentials=True)
+    try:
+        with pytest.raises(ConflictError, match="support_root outside the active realm root"):
+            offline.replace_from_backup(backup)
+        assert active_root.is_dir()
+    finally:
+        offline.stop()
+
+
+def test_cleanup_does_not_shutdown_http_server_without_serving_thread():
+    daemon = RuntimeDaemon("/tmp/runtime-cleanup-regression", production_worker_credentials=True)
+    daemon.httpd = RuntimeHTTPServer(("127.0.0.1", 0), RuntimeHandler)
+    try:
+        daemon._shutdown_http()
+        assert daemon.httpd is None
+        assert daemon.thread is None
+    finally:
+        daemon._shutdown_http()
 
 
 def _register_catalog_worker(path, realm_id, ready, release, result):
