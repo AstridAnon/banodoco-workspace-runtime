@@ -49,3 +49,12 @@ def test_settlement_schema_allows_bounded_inline_output_bytes() -> None:
     }
     errors = list(Draft202012Validator(settlement).iter_errors(instance))
     assert not errors, "\n".join(error.message for error in errors)
+
+
+def test_worker_schema_declares_continuation_waits_and_output_primary_contract() -> None:
+    schema = json.loads((ROOT / "contract/schemas/worker.json").read_text())
+    claim_waiting = schema["definitions"]["ClaimWaiting"]["properties"]["waiting_reason"]
+    assert {"waiting_for_dependencies", "dependency_failed", "dependency_cancelled"} <= set(claim_waiting["enum"])
+    output = schema["definitions"]["Output"]["properties"]
+    assert output["is_primary"] == {"type": "boolean"}
+    assert output["role"]["maxLength"] == 255
