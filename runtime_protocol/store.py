@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
+from .dirfd import remove_tree_at
 from .util import canonical_json, new_id, now
 
 try:
@@ -214,6 +215,9 @@ class RealmStore:
         store._lock_file = None
         store._mutex = threading.RLock()
         store.conn = None
+        parent_fd = -1
+        published = False
+        root_was_present = root.exists()
         try:
             store._acquire_owner()
             store._open(fresh=True)
@@ -237,19 +241,32 @@ class RealmStore:
             finally:
                 os.close(staged_fd)
             parent_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.rename(staged_root.name, root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
+            os.rename(staged_root.name, root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            published = True
+            os.fsync(parent_fd)
             # Reopen only after the complete staged tree is published.  This
             # also returns paths rooted at the public final name.
             return cls(root)
         except Exception:
             store.close()
-            if staged_root.exists() and staged_root != root:
+            if published and parent_fd >= 0:
+                # The final name may already be visible when durability or
+                # post-publication admission fails.  Remove it below the
+                # retained parent descriptor so a retry cannot admit a
+                # partially published tree or follow a swapped path.
+                try:
+                    remove_tree_at(parent_fd, root.name)
+                    if root_was_present:
+                        os.mkdir(root.name, 0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+            elif staged_root.exists():
                 shutil.rmtree(staged_root, ignore_errors=True)
             raise
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
 
     def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         self.root = Path(root).expanduser().resolve()
