@@ -234,7 +234,6 @@ class RealmStore:
             store.admission_report = store.integrity_report()
             if not store.admission_report.get("ok"):
                 raise RealmAdmissionError("fresh realm failed canonical admission", details=store.admission_report)
-            store.close()
             staged_fd = os.open(staged_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
                 os.fsync(staged_fd)
@@ -244,11 +243,18 @@ class RealmStore:
             os.rename(staged_root.name, root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             published = True
             os.fsync(parent_fd)
-            # Reopen only after the complete staged tree is published.  This
-            # also returns paths rooted at the public final name.
-            return cls(root)
+            # Keep the staged owner lock held through publication and final
+            # admission. Reopening here would create an ownership race in
+            # which another opener can acquire the just-published root before
+            # the creator's second admission completes.
+            store.root = root
+            store.lock_path = root / "owner.lock"
+            store.db_path = root / "realm.sqlite3"
+            store.cas_root = root / "cas" / "sha256"
+            store.staging_root = root / "staging"
+            return store
         except Exception:
-            store.close()
+            rollback_error = None
             if published and parent_fd >= 0:
                 # The final name may already be visible when durability or
                 # post-publication admission fails.  Remove it below the
@@ -259,10 +265,22 @@ class RealmStore:
                     if root_was_present:
                         os.mkdir(root.name, 0o700, dir_fd=parent_fd)
                     os.fsync(parent_fd)
-                except OSError:
-                    pass
+                except Exception as exc:
+                    rollback_error = exc
             elif staged_root.exists():
-                shutil.rmtree(staged_root, ignore_errors=True)
+                try:
+                    shutil.rmtree(staged_root)
+                except Exception as exc:
+                    rollback_error = exc
+            try:
+                store.close()
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+            if rollback_error is not None:
+                raise RealmAdmissionError(
+                    "fresh realm publication rollback failed; manual recovery is required",
+                    details={"root": str(root), "rollback_error": str(rollback_error)},
+                ) from rollback_error
             raise
         finally:
             if parent_fd >= 0:

@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 
@@ -6,7 +7,7 @@ import runtime_protocol.backup as backup_module
 import runtime_protocol.store as store_module
 from runtime_protocol.backup import verify_backup
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
+from runtime_protocol.errors import ConflictError, LeaseError, OwnerBusyError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
@@ -63,6 +64,48 @@ def test_fresh_creation_post_rename_fsync_rolls_back_and_is_retryable(tmp_path, 
         retry.close()
 
 
+def test_fresh_creation_keeps_owner_custody_through_publication(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    original_fsync = store_module.os.fsync
+    interposed = threading.Event()
+    outcome = []
+
+    def interpose_competing_opener(fd):
+        if root.exists() and not interposed.is_set():
+            interposed.set()
+            try:
+                RealmStore(root)
+            except Exception as exc:
+                outcome.append((type(exc), str(exc)))
+            else:  # pragma: no cover - the owner lock must remain held
+                outcome.append((None, "other_owner_acquired"))
+        return original_fsync(fd)
+
+    monkeypatch.setattr(store_module.os, "fsync", interpose_competing_opener)
+    creator = RealmStore.initialize(root, realm_id="custody-realm", display_name="Custody Realm")
+    try:
+        assert interposed.is_set()
+        assert outcome == [(OwnerBusyError, "another runtime daemon owns this realm")]
+        project = creator.create_project("owner-write", "Owner Write", idempotency_key="owner-write")
+        assert creator.get_project(project["id"])["name"] == "Owner Write"
+    finally:
+        creator.close()
+
+
+def test_direct_generation_publication_remains_refused(tmp_path):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        refusal = "direct generation publication is disabled"
+        with pytest.raises(ConflictError, match=refusal):
+            service.create_generation("project", {})
+        with pytest.raises(ConflictError, match="direct variant publication is disabled"):
+            service.create_variant("generation", {})
+    finally:
+        service.close()
+
+
 def test_backup_candidate_is_verified_before_publication(tmp_path, monkeypatch):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
@@ -107,6 +150,40 @@ def test_replacement_epoch_floor_survives_restarts_and_fences_stale_worker(tmp_p
             )
         floor = json.loads((support / "runtime-epoch-floor.json").read_text())
         assert floor["runtime_epoch_floor"] == result["runtime_epoch"]
+    finally:
+        daemon.stop()
+
+
+def test_older_snapshot_offline_replacement_preserves_external_support_custody(tmp_path):
+    active = tmp_path / "active"
+    support = tmp_path / "support"
+    RealmStore.initialize(active).close()
+    daemon = RuntimeDaemon(active, support_root=support, production_worker_credentials=True).start()
+    backup = tmp_path / "older-backup"
+    try:
+        daemon.service.backup(backup)
+        backup_key = (support / "backup-auth.key").read_bytes()
+        old_epoch = daemon.service.health()["runtime_epoch"]
+        daemon.stop()
+        daemon.start()
+        daemon.stop()
+        daemon.start()
+        live_epoch = daemon.service.health()["runtime_epoch"]
+        assert live_epoch > old_epoch
+        daemon.stop()
+
+        result = daemon.replace_from_backup(backup)
+        assert result["offline"] is True
+        assert result["runtime_epoch"] > live_epoch
+        assert (support / "backup-auth.key").read_bytes() == backup_key
+        assert (support / "credentials" / "owner.token").is_file()
+        floor = json.loads((support / "runtime-epoch-floor.json").read_text())
+        assert floor["runtime_epoch_floor"] == result["runtime_epoch"]
+        catalog = json.loads((support / "catalog.json").read_text())
+        row = next(item for item in catalog["realms"] if item["realm_id"] == result["realm_id"])
+        assert row["data_root"] == str(active)
+        assert row["runtime_epoch"] == result["runtime_epoch"]
+        assert row["readiness"] == "ready"
     finally:
         daemon.stop()
 

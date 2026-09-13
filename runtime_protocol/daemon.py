@@ -115,7 +115,12 @@ class RuntimeDaemon:
 
     def _shutdown_http(self):
         if self.httpd:
-            self.httpd.shutdown()
+            # HTTPServer.shutdown() waits for serve_forever() to be running.
+            # Replacement startup can fail after constructing the server but
+            # before its serving thread starts; calling shutdown in that state
+            # hangs cleanup indefinitely.
+            if self.thread is not None and self.thread.is_alive():
+                self.httpd.shutdown()
             self.httpd.server_close()
             self.httpd = None
         self.thread = None
@@ -178,6 +183,17 @@ class RuntimeDaemon:
     def _replacement_state_path(self):
         return self.support_root / "replacement-state.json"
 
+    def _require_replacement_support_layout(self):
+        """Require support custody to remain outside the movable realm tree."""
+        try:
+            self.support_root.relative_to(self.root)
+        except ValueError:
+            return
+        raise ConflictError(
+            "replacement requires support_root outside the active realm root; "
+            "pass an explicit sibling support_root so epoch, credentials, and catalog state survive the move"
+        )
+
     def _write_replacement_state(self, *, state, candidate, superseded=None, error=None):
         value = {
             "format_version": 1,
@@ -195,6 +211,7 @@ class RuntimeDaemon:
         """Atomically activate a verified inactive candidate under one owner."""
         if self.service is None or self.httpd is None:
             raise ConflictError("replacement requires a running runtime owner")
+        self._require_replacement_support_layout()
         candidate = _authority_path(candidate_root, "restore candidate").resolve()
         if candidate == self.root or candidate.parent != self.root.parent:
             raise ConflictError("replacement candidate must be an inactive sibling of the active realm")
@@ -301,6 +318,7 @@ class RuntimeDaemon:
         """
         if self.service is not None or self.httpd is not None:
             raise ConflictError("offline replacement requires a stopped runtime")
+        self._require_replacement_support_layout()
         backup = _authority_path(backup_root, "backup").resolve()
         # This is deliberately independent of active-root admission.
         verify_backup(backup)
