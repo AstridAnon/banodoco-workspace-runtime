@@ -405,10 +405,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     return self._send(200, self.runtime.list_media_relations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body(), idempotency_key=self._idempotency_key()))
         if path == ["v1", "objects"] and method == "POST":
-            self._identity("objects:write")
+            identity = self._identity("objects:write")
             key = self._idempotency_key()
             data = self._raw_body()
-            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
+            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity)
             return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")

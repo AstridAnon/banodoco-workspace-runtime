@@ -2277,8 +2277,60 @@ class RuntimeService:
                 self._discard_published_digest(obj["digest"])
             raise
 
+    def _generic_output_upload_binding(self, identity, digest):
+        """Return the sole live attempt for a worker output upload.
+
+        The generic client does not have project-write authority and its
+        upload call carries only the worker bearer.  If that bearer has one
+        live attempt, bind the durable upload receipt to that exact lease.
+        Ambiguous or absent execution context remains a valid unscoped upload,
+        but can never be adopted by fenced task settlement.
+        """
+        if identity is None:
+            return None
+        actor = identity.get("actor")
+        if not isinstance(actor, str) or not actor:
+            return None
+        rows = self.store.conn.execute(
+            "SELECT a.id AS attempt_id, a.task_id, a.executor_id, a.lease_id, a.fence, "
+            "a.runtime_epoch, t.run_id, r.project_id "
+            "FROM attempts AS a "
+            "JOIN tasks AS t ON t.id=a.task_id "
+            "JOIN runs AS r ON r.id=t.run_id "
+            "WHERE a.executor_id=? AND a.settled=0 AND t.status='running' "
+            "AND t.attempt_id=a.id AND t.executor_id=a.executor_id "
+            "AND t.lease_token=a.lease_id AND t.lease_fence=a.fence",
+            (actor,),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        return {
+            "project_id": row["project_id"],
+            "run_id": row["run_id"],
+            "task_id": row["task_id"],
+            "attempt_id": row["attempt_id"],
+            "executor_id": row["executor_id"],
+            "lease_id": row["lease_id"],
+            "fence": int(row["fence"]),
+            "runtime_epoch": int(row["runtime_epoch"]),
+            "output_key": "output-" + digest,
+        }
+
+    @staticmethod
+    def _generic_output_request_hash(digest, media_type, original_name, expected_digest, binding):
+        request = {
+            "content_digest": digest,
+            "media_type": media_type,
+            "original_name": original_name,
+            "expected_digest": expected_digest,
+        }
+        if binding is not None:
+            request["publication_binding"] = binding
+        return hashlib.sha256(canonical_json(request).encode()).hexdigest()
+
     @_durable_mutation
-    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
+    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise InvalidRequestError("object body must be bytes")
@@ -2286,19 +2338,18 @@ class RuntimeService:
             raise ValidationError("object exceeds 64 MiB limit")
         data = bytes(data)
         expected = (expected_digest or "").removeprefix("sha256:") or None
-        request_hash = hashlib.sha256(canonical_json({
-            "content_digest": sha256_bytes(data),
-            "media_type": media_type,
-            "original_name": original_name,
-            "expected_digest": expected,
-        }).encode()).hexdigest()
+        digest = sha256_bytes(data)
+        binding = self._generic_output_upload_binding(identity, digest)
+        request_hash = self._generic_output_request_hash(
+            digest, media_type, original_name, expected, binding,
+        )
         aggregate_id = "objects"
         replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id="unscoped")
         if replay is not None:
             return replay
-        destination = self.cas.path_for(sha256_bytes(data))
+        destination = self.cas.path_for(digest)
         if not destination.exists():
-            self._begin_cas_publication_journal("ingest", [{"digest": sha256_bytes(data)}], project_id="unscoped")
+            self._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
         obj = self.cas.put(data, expected_digest=expected)
         try:
             timestamp = now()
@@ -2829,7 +2880,14 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
-            staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id)
+            staged = self._stage_outputs(
+                attempt_id,
+                body.get("outputs", []),
+                project_id=project_id,
+                attempt_row=row,
+                task_row=task,
+                lease_body=body,
+            )
             try:
                 # Persist one flat result object. Outputs are the only
                 # reserved field and are added atomically with user fields.
@@ -3025,16 +3083,20 @@ class RuntimeService:
                 )
                 return result
 
-    def _is_authorized_generic_output(self, digest, size, media_type):
+    def _is_authorized_generic_output(
+        self, digest, size, media_type, *, filename, recorded_filename,
+        attempt_row, task_row, project_id, lease_body,
+    ):
         """Recognize the worker's unscoped output upload receipt.
 
         Generic producers cannot create a project association during their
-        upload.  Settlement may adopt that exact object only when the
-        unscoped upload was recorded under the producer's deterministic
-        output idempotency key and its durable result matches the descriptor.
+        upload. Settlement may adopt that exact object only when the
+        unscoped upload's request hash carries the current task/run/project,
+        attempt, executor, lease/fence, filename, and deterministic output
+        key, and its durable result matches the descriptor.
         """
         row = self.store.conn.execute(
-            "SELECT result_json FROM command_idempotency "
+            "SELECT request_hash, result_json FROM command_idempotency "
             "WHERE command_kind='object.ingest' AND aggregate_id='objects' "
             "AND idempotency_key=?",
             ("output-" + digest,),
@@ -3047,6 +3109,26 @@ class RuntimeService:
             return False
         if not isinstance(result, dict):
             return False
+        if attempt_row is None or task_row is None or lease_body is None:
+            return False
+        if recorded_filename != filename:
+            return False
+        binding = {
+            "project_id": project_id,
+            "run_id": task_row["run_id"],
+            "task_id": task_row["id"],
+            "attempt_id": attempt_row["id"],
+            "executor_id": attempt_row["executor_id"],
+            "lease_id": lease_body["lease_id"],
+            "fence": int(lease_body["fence"]),
+            "runtime_epoch": int(lease_body["runtime_epoch"]),
+            "output_key": "output-" + digest,
+        }
+        expected_hash = self._generic_output_request_hash(
+            digest, media_type, filename, None, binding,
+        )
+        if row["request_hash"] != expected_hash:
+            return False
         try:
             recorded_size = int(result.get("size", -1))
         except (TypeError, ValueError):
@@ -3058,7 +3140,7 @@ class RuntimeService:
             and result.get("media_type") == media_type
         )
 
-    def _stage_outputs(self, attempt_id, outputs, *, project_id=None):
+    def _stage_outputs(self, attempt_id, outputs, *, project_id=None, attempt_row=None, task_row=None, lease_body=None):
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
             raise ValidationError("outputs must be a list")
@@ -3214,7 +3296,7 @@ class RuntimeService:
                 coverage = output.get("coverage")
                 if coverage is not None:
                     coverage = _validate_coverage(coverage)
-                existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                existing = self.store.conn.execute("SELECT size, media_type, original_name FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
                         raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
@@ -3222,7 +3304,17 @@ class RuntimeService:
                         has_project_owner = self.store.conn.execute(
                             "SELECT 1 FROM project_objects WHERE digest=? LIMIT 1", (digest,)
                         ).fetchone()
-                        if has_project_owner or not self._is_authorized_generic_output(digest, size, media_type):
+                        if has_project_owner or not self._is_authorized_generic_output(
+                            digest,
+                            size,
+                            media_type,
+                            filename=filename,
+                            recorded_filename=existing["original_name"],
+                            attempt_row=attempt_row,
+                            task_row=task_row,
+                            project_id=project_id,
+                            lease_body=lease_body,
+                        ):
                             raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
