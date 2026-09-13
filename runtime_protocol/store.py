@@ -869,6 +869,164 @@ class RealmStore:
                     details={"project_id": project_id, "object_id": object_id},
                 )
 
+    def _freeze_managed_render_inputs(self, project_id, spec, supplied_input_object_ids):
+        """Freeze a managed ``rendering.render`` timeline at admission.
+
+        Some consumers submit the HC-04 shape directly instead of going
+        through Astrid's managed-render helper.  Runtime is the authenticated
+        project/timeline authority, so it may resolve that reference once and
+        carry the resulting immutable snapshot into the claimed task.  The
+        generic host still receives only the snapshot and never gets project
+        or timeline read scope.
+        """
+        if not isinstance(spec, dict):
+            raise ValidationError("task spec must be an object")
+        params = spec.get("params")
+        if not isinstance(params, dict) or "timeline_ref" not in params:
+            return spec, supplied_input_object_ids
+        frozen = json.loads(canonical_json(spec))
+        params = frozen["params"]
+        timeline_ref = params.get("timeline_ref")
+        if not isinstance(timeline_ref, str) or not timeline_ref.strip():
+            raise ValidationError("rendering.render timeline_ref must be a non-empty project-scoped selector")
+        timeline_ref = timeline_ref.strip()
+        params["timeline_ref"] = timeline_ref
+        if project_id is None:
+            raise ValidationError("rendering.render timeline_ref requires a project")
+        inputs = frozen.get("inputs")
+        if inputs is None:
+            inputs = {}
+            frozen["inputs"] = inputs
+        if not isinstance(inputs, dict):
+            raise ValidationError("rendering.render inputs must be an object")
+        for field, message in (
+            ("timeline", "managed rendering does not accept a caller-supplied timeline path"),
+            ("assets_registry", "managed rendering does not accept a caller-supplied assets registry path"),
+            ("materialized_root", "managed rendering materialization is host-owned"),
+            ("materialized_objects", "managed rendering materialization is host-owned"),
+            ("timeline_snapshot", "managed rendering timeline_snapshot is Runtime-owned"),
+            ("timeline_authority", "managed rendering timeline_authority is Runtime-owned"),
+        ):
+            if inputs.get(field) not in (None, ""):
+                raise ValidationError(message)
+        supplied_input_ref = inputs.get("timeline_ref")
+        if supplied_input_ref not in (None, "", timeline_ref):
+            raise ConflictError("render timeline_ref bindings conflict")
+        supplied_version = params.get("expected_version")
+        if supplied_version is not None and (
+            isinstance(supplied_version, bool)
+            or not isinstance(supplied_version, int)
+            or supplied_version < 1
+        ):
+            raise ValidationError("render expected_version must be a positive integer")
+
+        rows = self.conn.execute(
+            "SELECT id, archived_at FROM timelines WHERE project_id=? ORDER BY created_at, id",
+            (project_id,),
+        ).fetchall()
+        matches = []
+        for row in rows:
+            document = self.conn.execute(
+                "SELECT content_json, version FROM project_documents WHERE id=? AND project_id=?",
+                (f"timeline:{row['id']}", project_id),
+            ).fetchone()
+            content = json.loads(document["content_json"]) if document else {}
+            slug = content.get("slug") if isinstance(content, dict) else None
+            if timeline_ref in {str(row["id"]), str(slug or "")}:
+                matches.append((row, document, content))
+        if not matches:
+            raise NotFoundError(
+                "timeline_ref is not in the selected project",
+                details={"project_id": project_id, "timeline_ref": timeline_ref},
+            )
+        if len(matches) != 1:
+            raise ConflictError("timeline_ref is ambiguous within the selected project")
+        row, document, content = matches[0]
+        if row["archived_at"]:
+            raise ConflictError(
+                "timeline_ref identifies an archived timeline",
+                details={"timeline_id": row["id"], "timeline_ref": timeline_ref},
+            )
+        if not isinstance(content, dict) or not isinstance(content.get("config"), dict) or not isinstance(content.get("registry"), dict):
+            raise ValidationError("canonical timeline config and registry must be objects")
+        config = content["config"]
+        registry = content["registry"]
+        assets = registry.get("assets", {})
+        if not isinstance(assets, dict):
+            raise ValidationError("canonical timeline registry assets must be an object")
+        ordered_input_ids = []
+        managed_media = {}
+        for asset_name, asset in assets.items():
+            if not isinstance(asset, dict):
+                raise ValidationError("canonical timeline registry assets must contain objects")
+            media_id = asset.get("media_id") or asset.get("object_id")
+            if not isinstance(media_id, str) or not media_id.strip():
+                raise ValidationError(
+                    f"canonical timeline asset {asset_name!r} has no runtime media identity"
+                )
+            digest = next(
+                (
+                    value
+                    for key in ("content_sha256", "object_id", "digest", "sha256", "hash")
+                    for value in (asset.get(key),)
+                    if isinstance(value, str) and OBJECT_ID_RE.fullmatch(value)
+                ),
+                None,
+            )
+            if digest is None:
+                raise ValidationError(
+                    f"canonical timeline asset {asset_name!r} has no runtime content digest"
+                )
+            normalized = "sha256:" + OBJECT_ID_RE.fullmatch(digest).group(1)
+            if normalized not in ordered_input_ids:
+                ordered_input_ids.append(normalized)
+            managed_media[media_id] = normalized
+        supplied = list(supplied_input_object_ids or [])
+        if supplied:
+            normalized_supplied = []
+            for value in supplied:
+                match = OBJECT_ID_RE.fullmatch(value) if isinstance(value, str) else None
+                if match is None:
+                    raise ValidationError("input_object_ids must contain sha256 object IDs")
+                normalized_supplied.append("sha256:" + match.group(1))
+            if normalized_supplied != ordered_input_ids:
+                raise ConflictError(
+                    "render input_object_ids do not match the canonical timeline registry",
+                    details={"expected": ordered_input_ids, "actual": normalized_supplied},
+                )
+
+        config_version = int(document["version"] if document else row["version"])
+        if supplied_version is not None and supplied_version != config_version:
+            raise ConflictError(
+                "render expected_version does not match the canonical timeline",
+                details={"expected": supplied_version, "actual": config_version},
+            )
+        config_hash = hashlib.sha256(canonical_json(config).encode()).hexdigest()
+        registry_hash = hashlib.sha256(canonical_json(registry).encode()).hexdigest()
+        event = self.conn.execute(
+            "SELECT id, event_hash FROM timeline_events WHERE timeline_id=? ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        authority = {
+            "authority": "kernel",
+            "project_id": project_id,
+            "project_slug": self._project(project_id)["slug"],
+            "timeline_id": row["id"],
+            "timeline_ulid": row["id"],
+            "timeline_slug": content.get("slug", row["id"]),
+            "config_version": config_version,
+            "head_event_id": str(event["id"] if event else f"timeline:{row['id']}:{config_version}"),
+            "head_hash": event["event_hash"] if event else config_hash,
+            "config_hash": config_hash,
+            "registry_hash": registry_hash,
+            "materialized_registry_hash": registry_hash,
+            "managed_media_admissions": managed_media,
+        }
+        frozen["timeline_snapshot"] = {"config": config, "registry": registry}
+        inputs["timeline_ref"] = timeline_ref
+        inputs["timeline_authority"] = authority
+        return frozen, ordered_input_ids
+
     @staticmethod
     def _validate_storage_estimate(storage_estimate):
         """Validate an optional immutable, request-specific disk estimate.
@@ -914,9 +1072,17 @@ class RealmStore:
         if isinstance(spec, dict) and "required_facts" in spec:
             spec = dict(spec)
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
-        predecessors = self._continuation_predecessors(spec)
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
+            if capability == "rendering.render":
+                admitted_spec = spec.get("spec") if isinstance(spec, dict) else None
+                admitted_spec, frozen_inputs = self._freeze_managed_render_inputs(
+                    project_id, admitted_spec, spec.get("input_object_ids", []) if isinstance(spec, dict) else [],
+                )
+                spec = dict(spec)
+                spec["spec"] = admitted_spec
+                spec["input_object_ids"] = frozen_inputs
+            predecessors = self._continuation_predecessors(spec)
             if isinstance(expected_effect, dict) and expected_effect.get("effect_type") == "generation.publish_v1":
                 # The typed GEN publication plan is admitted against the task
                 # project before any durable task/run rows are created. Its
