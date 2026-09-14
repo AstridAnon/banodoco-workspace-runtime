@@ -8,9 +8,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from banodoco_workspace_client import ApiError, WorkspaceClient  # noqa: E402
-from runtime_protocol.errors import ConflictError
+from runtime_protocol.errors import ConflictError, ValidationError
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.service import RuntimeService
+from runtime_protocol.service import RuntimeService, _canonical_managed_output_filename
 from runtime_protocol.store import RealmStore
 
 
@@ -18,7 +18,7 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _settled_service(root: Path, export_root: Path) -> tuple[RuntimeService, dict, dict, bytes, int]:
+def _settled_service(root: Path, export_root: Path, *, filename: str = "retained-render.bin") -> tuple[RuntimeService, dict, dict, bytes, int]:
     RealmStore.initialize(root).close()
     service = RuntimeService(root, export_root=export_root)
     project = service.create_project({"slug": "exports", "name": "Exports"})
@@ -41,7 +41,6 @@ def _settled_service(root: Path, export_root: Path) -> tuple[RuntimeService, dic
         identity=worker_identity,
     )
     payload = b"retained-render-output"
-    filename = "retained-render.bin"
     media_type = "application/octet-stream"
     binding = {
         "project_id": project["id"], "run_id": task["run"]["id"], "task_id": attempt["task_id"],
@@ -119,6 +118,62 @@ def test_export_fails_closed_without_runtime_export_root(tmp_path: Path) -> None
             )
     finally:
         service.close()
+
+
+def test_legacy_images_filename_is_canonicalized_for_settlement_and_export(tmp_path: Path) -> None:
+    root = tmp_path / "realm"
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    first, association, _task, payload, production_epoch = _settled_service(
+        root, export_root, filename="images/output_000.png",
+    )
+    try:
+        assert association["filename"] == "output_000.png"
+        assert association["digest"].startswith("sha256:")
+    finally:
+        first.close()
+
+    second = RuntimeService(root, export_root=export_root)
+    try:
+        result = second.export_managed_output(
+            association["association_id"],
+            {"destination_filename": "output_000.png", "expected": {"digest": association["digest"], "runtime_epoch": production_epoch}},
+            idempotency_key="legacy-images-export",
+        )
+        assert (export_root / "output_000.png").read_bytes() == payload
+        assert result["data"]["destination"]["filename"] == "output_000.png"
+        assert result["data"]["digest"] == association["digest"]
+    finally:
+        second.close()
+
+
+def test_existing_legacy_images_association_exports_without_source_rewrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "realm"
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    first, association, _task, payload, production_epoch = _settled_service(root, export_root)
+    first.close()
+    second = RuntimeService(root, export_root=export_root)
+    legacy = dict(association)
+    legacy["filename"] = "images/output_000.png"
+    monkeypatch.setattr(second.store, "get_managed_output", lambda _association_id: legacy)
+    try:
+        result = second.export_managed_output(
+            association["association_id"],
+            {"destination_filename": "images/output_000.png", "expected": {"digest": association["digest"], "runtime_epoch": production_epoch}},
+            idempotency_key="legacy-association-export",
+        )
+        assert (export_root / "output_000.png").read_bytes() == payload
+        assert result["data"]["filename"] == "images/output_000.png"
+        assert result["data"]["destination"]["filename"] == "output_000.png"
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize("filename", ["../output.png", "images/../output.png", "/tmp/output.png", "images/nested/output.png", "images\\output.png"])
+def test_managed_output_filename_rejects_arbitrary_paths(filename: str) -> None:
+    with pytest.raises(ValidationError, match="output filename"):
+        _canonical_managed_output_filename(filename)
 
 
 def test_generated_http_export_replay_conflict_and_durable_event(tmp_path: Path) -> None:

@@ -48,6 +48,21 @@ TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
 MEDIA_PROBE_TIMEOUT_SECONDS = 10
 
 
+def _canonical_managed_output_filename(value):
+    """Return a flat export name while admitting only the legacy image prefix."""
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise ValidationError("output filename is invalid")
+    if any(ord(char) < 32 for char in value):
+        raise ValidationError("output filename is invalid")
+    if value not in {".", ".."} and "/" not in value and "\\" not in value:
+        return value
+    if value.startswith("images/"):
+        leaf = value.removeprefix("images/")
+        if leaf and leaf not in {".", ".."} and "/" not in leaf and "\\" not in leaf:
+            return leaf
+    raise ValidationError("output filename must be a direct safe file name or images/<direct safe file name>")
+
+
 def _validate_rational(value, field):
     """Validate the V1 exact rational wire form without floating-point loss."""
     if isinstance(value, str):
@@ -2550,10 +2565,11 @@ class RuntimeService:
             raise ConflictError("managed output CAS size does not match its association")
         if str(object_row["media_type"]) != str(association["media_type"]):
             raise ConflictError("managed output media type does not match its CAS object")
-        filename = str(association["filename"])
-        if not filename or filename in {".", ".."} or Path(filename).name != filename or "/" in filename or "\\" in filename:
-            raise ConflictError("managed output filename is not a direct safe file name")
-        return association, attempt, data
+        try:
+            export_filename = _canonical_managed_output_filename(str(association["filename"]))
+        except ValidationError as exc:
+            raise ConflictError("managed output filename is not a direct safe file name") from exc
+        return association, attempt, data, export_filename
 
     def _materialize_export(self, filename, data):
         if self.export_root is None:
@@ -2602,8 +2618,8 @@ class RuntimeService:
         unknown = sorted(set(expected) - allowed_expected)
         if unknown:
             raise ValidationError("expected export identity contains unsupported fields", details={"fields": unknown})
-        association, attempt, data = self._export_source(association_id)
-        if destination_filename != association["filename"]:
+        association, attempt, data, export_filename = self._export_source(association_id)
+        if destination_filename not in {association["filename"], export_filename}:
             raise ConflictError("export destination filename must equal managed output filename")
         source = {
             "project_id": association.get("project_id"),
@@ -2617,6 +2633,8 @@ class RuntimeService:
             "media_type": association["media_type"],
         }
         for field, value in expected.items():
+            if field == "filename" and value == export_filename:
+                continue
             if value != source[field]:
                 raise ConflictError("export identity assertion does not match", details={"field": field})
         request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
@@ -2628,11 +2646,11 @@ class RuntimeService:
             "export_id": "export-" + new_id(),
             **source,
             "producer": association.get("producer") or {},
-            "destination": {"root": str(self.export_root), "filename": destination_filename},
+            "destination": {"root": str(self.export_root), "filename": export_filename},
             "source_provenance": association.get("provenance") or {},
             "exported_at": now(),
         }
-        self._materialize_export(destination_filename, data)
+        self._materialize_export(export_filename, data)
         event_id = self.store._append_event(
             association["run_id"], association["task_id"], "managed_output.exported", result,
         )
@@ -3272,7 +3290,11 @@ class RuntimeService:
         """
         if attempt_row is None or task_row is None or lease_body is None:
             return False
-        if recorded_filename != filename:
+        try:
+            canonical_recorded_filename = _canonical_managed_output_filename(recorded_filename)
+        except ValidationError:
+            return False
+        if canonical_recorded_filename != filename:
             return False
         binding = {
             "project_id": project_id,
@@ -3285,7 +3307,9 @@ class RuntimeService:
             "runtime_epoch": int(lease_body["runtime_epoch"]),
             "output_key": name,
             "output_port": output_port,
-            "filename": filename,
+            # Upload receipts are keyed by the producer's original name;
+            # settlement stores its canonical flat managed name.
+            "filename": recorded_filename,
             "digest": "sha256:" + digest,
             "size": int(size),
             "media_type": media_type,
@@ -3306,7 +3330,7 @@ class RuntimeService:
         if not isinstance(result, dict):
             return False
         expected_hash = self._generic_output_request_hash(
-            digest, media_type, filename, None, binding,
+            digest, media_type, recorded_filename, None, binding,
         )
         if row["request_hash"] != expected_hash:
             return False
@@ -3360,9 +3384,7 @@ class RuntimeService:
                 name = output.get("name", "output")
                 if not isinstance(name, str) or not name or len(name) > 512:
                     raise ValidationError("output name must be a non-empty string")
-                filename = output.get("filename", name)
-                if not isinstance(filename, str) or not filename or len(filename) > 512 or any(ord(char) < 32 for char in filename):
-                    raise ValidationError("output filename is invalid")
+                filename = _canonical_managed_output_filename(output.get("filename", name))
                 media_type = output.get("media_type", "application/octet-stream")
                 if not isinstance(media_type, str) or not media_type or len(media_type) > 255 or any(ord(char) < 32 for char in media_type):
                     raise ValidationError("output media_type is invalid")
