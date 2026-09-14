@@ -430,9 +430,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     if unit != "bytes" or "," in spec:
                         raise ValueError
                     left, right = spec.split("-", 1)
-                    start = int(left) if left else max(0, total - int(right))
-                    end = int(right) if right else total - 1
-                    if start < 0 or end < start or end >= total:
+                    if not left:
+                        suffix_length = int(right)
+                        if suffix_length <= 0:
+                            raise ValueError
+                        start, end = max(0, total - suffix_length), total - 1
+                    else:
+                        start = int(left)
+                        end = int(right) if right else total - 1
+                        end = min(end, total - 1)
+                    if start < 0 or start >= total or end < start:
                         raise ValueError
                     status = 206
                 except ValueError as exc:
