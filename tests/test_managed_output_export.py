@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _settled_service(root: Path, export_root: Path, *, filename: str = "retained-render.bin") -> tuple[RuntimeService, dict, dict, bytes, int]:
+def _settled_service(root: Path, export_root: Path, *, filename: str = "retained-render.bin", staged: bool = False) -> tuple[RuntimeService, dict, dict, bytes, int]:
     RealmStore.initialize(root).close()
     service = RuntimeService(root, export_root=export_root)
     project = service.create_project({"slug": "exports", "name": "Exports"})
@@ -49,19 +50,23 @@ def _settled_service(root: Path, export_root: Path, *, filename: str = "retained
         "output_port": "render", "filename": filename, "digest": _digest(payload), "size": len(payload),
         "media_type": media_type,
     }
-    service.ingest_object(
-        payload, media_type=media_type, original_name=filename,
-        idempotency_key=service._generic_output_idempotency_key(binding),
-        identity=worker_identity, upload_binding=binding,
-    )
+    if not staged:
+        service.ingest_object(
+            payload, media_type=media_type, original_name=filename,
+            idempotency_key=service._generic_output_idempotency_key(binding),
+            identity=worker_identity, upload_binding=binding,
+        )
+    output = {
+        "name": "render", "kind": "object", "filename": filename, "output_port": "render",
+        "digest": _digest(payload), "media_type": media_type, "size": len(payload),
+        "role": "result", "durability": "durable", "producer": {"capability_id": "rendering.export"},
+    }
+    if staged:
+        output["data_base64"] = base64.b64encode(payload).decode("ascii")
     service.settle_attempt(
         attempt["attempt_id"], {
             "lease_id": attempt["lease_id"], "fence": attempt["fence"],
-            "runtime_epoch": attempt["runtime_epoch"], "outputs": [{
-                "name": "render", "kind": "object", "filename": filename, "output_port": "render",
-                "digest": _digest(payload), "media_type": media_type, "size": len(payload),
-                "role": "result", "durability": "durable", "producer": {"capability_id": "rendering.export"},
-            }],
+            "runtime_epoch": attempt["runtime_epoch"], "outputs": [output],
         },
         idempotency_key="export-settle",
         identity=worker_identity,
@@ -120,15 +125,17 @@ def test_export_fails_closed_without_runtime_export_root(tmp_path: Path) -> None
         service.close()
 
 
-def test_legacy_images_filename_is_canonicalized_for_settlement_and_export(tmp_path: Path) -> None:
+@pytest.mark.parametrize("prefix, leaf", [("images", "output_000.png"), ("videos", "output_000.mp4"), ("audio", "output_000.wav")])
+@pytest.mark.parametrize("staged", [False, True])
+def test_known_legacy_filename_is_canonicalized_for_settlement_and_export(tmp_path: Path, prefix: str, leaf: str, staged: bool) -> None:
     root = tmp_path / "realm"
     export_root = tmp_path / "exports"
     export_root.mkdir()
     first, association, _task, payload, production_epoch = _settled_service(
-        root, export_root, filename="images/output_000.png",
+        root, export_root, filename=f"{prefix}/{leaf}", staged=staged,
     )
     try:
-        assert association["filename"] == "output_000.png"
+        assert association["filename"] == leaf
         assert association["digest"].startswith("sha256:")
     finally:
         first.close()
@@ -137,11 +144,11 @@ def test_legacy_images_filename_is_canonicalized_for_settlement_and_export(tmp_p
     try:
         result = second.export_managed_output(
             association["association_id"],
-            {"destination_filename": "output_000.png", "expected": {"digest": association["digest"], "runtime_epoch": production_epoch}},
-            idempotency_key="legacy-images-export",
+            {"destination_filename": leaf, "expected": {"digest": association["digest"], "runtime_epoch": production_epoch}},
+            idempotency_key=f"legacy-{prefix}-export-{staged}",
         )
-        assert (export_root / "output_000.png").read_bytes() == payload
-        assert result["data"]["destination"]["filename"] == "output_000.png"
+        assert (export_root / leaf).read_bytes() == payload
+        assert result["data"]["destination"]["filename"] == leaf
         assert result["data"]["digest"] == association["digest"]
     finally:
         second.close()

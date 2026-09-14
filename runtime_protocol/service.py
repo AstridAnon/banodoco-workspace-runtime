@@ -48,19 +48,22 @@ TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
 MEDIA_PROBE_TIMEOUT_SECONDS = 10
 
 
+LEGACY_MANAGED_OUTPUT_PREFIXES = frozenset({"images", "videos", "audio"})
+
+
 def _canonical_managed_output_filename(value):
-    """Return a flat export name while admitting only the legacy image prefix."""
+    """Return a flat export name for the known producer-relative namespaces."""
     if not isinstance(value, str) or not value or len(value) > 512:
         raise ValidationError("output filename is invalid")
     if any(ord(char) < 32 for char in value):
         raise ValidationError("output filename is invalid")
     if value not in {".", ".."} and "/" not in value and "\\" not in value:
         return value
-    if value.startswith("images/"):
-        leaf = value.removeprefix("images/")
+    prefix, separator, leaf = value.partition("/")
+    if separator and prefix in LEGACY_MANAGED_OUTPUT_PREFIXES:
         if leaf and leaf not in {".", ".."} and "/" not in leaf and "\\" not in leaf:
             return leaf
-    raise ValidationError("output filename must be a direct safe file name or images/<direct safe file name>")
+    raise ValidationError("output filename must be a direct safe file name or a known producer namespace/<direct safe file name>")
 
 
 def _validate_rational(value, field):
