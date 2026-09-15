@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -56,6 +56,10 @@ REQUIRED_SCHEMA_COLUMNS = {
     "executors": frozenset("id max_concurrency resource_keys_json capabilities_json protocol created_at runtime_epoch readiness readiness_reason last_seen_at source_digest dependency_digest source_epoch".split()),
     "generation_variants": frozenset("id generation_id object_id variant_type metadata_json created_at".split()),
     "generations": frozenset("id project_id source_task_id type status metadata_json version created_at updated_at".split()),
+    "herzchen_domains": frozenset("domain_id descriptor_json created_at".split()),
+    "herzchen_identities": frozenset("authority kind id revision version payload_json edit_token created_at updated_at".split()),
+    "herzchen_identity_heads": frozenset("authority kind id revision version updated_at".split()),
+    "herzchen_references": frozenset("authority kind id revision created_at".split()),
     "media_references": frozenset("id reference_id media_id role ordinal is_primary metadata_json created_at".split()),
     "media_relations": frozenset("project_id from_digest to_digest kind ordinal metadata_json created_at".split()),
     "managed_output_associations": frozenset("association_id task_id attempt_id project_id output_port group_key generation_id variant_key object_digest manifest_digest size filename media_type ordinal role producer_json provenance_json durability regeneration_json coverage_json created_at".split()),

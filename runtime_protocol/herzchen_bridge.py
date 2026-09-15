@@ -19,12 +19,16 @@ import hashlib
 import json
 from typing import Any, Mapping, Optional
 
+from .util import new_id, now
+
 
 class HerzchenUnavailable(RuntimeError):
     """The shared Herzchen contract package is not available to this process."""
 
 
 try:  # Keep the Runtime importable in its normal standalone distribution.
+    from herzchen.content import ContentCommandHandler
+    from herzchen.extensions import ExtensionCommandService
     from herzchen.adapters import HerzchenHostAdapter
     from herzchen.contracts import (
         AuthenticatedActor,
@@ -46,10 +50,12 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
         IdentityRecord,
         RuntimeOperationOwner as HerzchenRuntimeOperationOwner,
         RuntimeOperationReader as HerzchenRuntimeOperationReader,
+        StoreAdmissionError,
         issue_operation_owner,
     )
     _HERZCHEN_IMPORT_ERROR: Optional[BaseException] = None
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised by standalone installs
+    ContentCommandHandler = ExtensionCommandService = None  # type: ignore[assignment]
     HerzchenHostAdapter = None  # type: ignore[assignment]
     AuthenticatedActor = CommandReceipt = DomainContribution = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
     canonical_json = validate_replay = None  # type: ignore[assignment]
@@ -58,7 +64,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by standalone
     OperationRequest = None  # type: ignore[assignment]
     request_digest = None  # type: ignore[assignment]
     IdentityRecord = None  # type: ignore[assignment]
-    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = issue_operation_owner = None  # type: ignore[assignment]
+    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = StoreAdmissionError = issue_operation_owner = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR = exc
 
 
@@ -419,6 +425,353 @@ if HerzchenRuntimeOperationOwner is not None:
             return tuple(event for event in self.list_events() if event.event_id in wanted)
 
 
+def _contract_json(value: Any) -> Any:
+    """Convert shared contract records to the Runtime JSON boundary."""
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return _contract_json(value.to_dict())
+    if isinstance(value, Mapping):
+        return {str(key): _contract_json(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_contract_json(child) for child in value]
+    return value
+
+
+class _RuntimeGenericReader(HerzchenRuntimeOperationReader if HerzchenRuntimeOperationReader is not None else object):
+    """Finite read view supplied to DAT content/extension consumers."""
+
+    __slots__ = ("_writer",)
+
+    def __init__(self, writer: "_RuntimeGenericWriter") -> None:
+        self._writer = writer
+
+    @property
+    def authority(self) -> str:
+        return self._writer.authority
+
+    def get_identity(self, ref: Any) -> Any:
+        return self._writer.get_identity(ref)
+
+    def get_reference(self, ref: Any) -> Any:
+        return self._writer.get_reference(ref)
+
+    def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
+        return ()
+
+
+class _RuntimeGenericWriter:
+    """DAT writer seam backed by the already-open Runtime RealmStore.
+
+    This adapter deliberately contains no connection of its own.  Generic
+    content identities, immutable revisions, references, and domain admission
+    live in Runtime's canonical SQLite realm and share its transaction and
+    command receipt boundary.  Core project/shot/document edits are delegated
+    to RuntimeService commands so those domains retain their existing owners.
+    """
+
+    __slots__ = ("bridge", "runtime", "store", "authority", "reader")
+
+    def __init__(self, bridge: "RuntimeHerzchenBridge") -> None:
+        self.bridge = bridge
+        self.runtime = bridge.runtime
+        self.store = getattr(bridge, "runtime").store
+        self.authority = bridge.authority
+        self.reader = _RuntimeGenericReader(self)
+
+    @contextmanager
+    def transaction(self):
+        with self.store._transaction():
+            yield self
+
+    def _require_transaction(self, transaction: Any) -> None:
+        if transaction is not None and transaction is not self and transaction is not True:
+            raise RuntimeOperationBindingError("generic DAT mutation used an unknown Runtime transaction")
+        if not self.store.conn.in_transaction:
+            raise RuntimeOperationBindingError("generic DAT mutation requires the active Runtime transaction")
+
+    @staticmethod
+    def _revision_key(ref: Any) -> str:
+        return "" if ref.revision is None else str(ref.revision)
+
+    def _row_for(self, ref: Any) -> Any:
+        return self.store.conn.execute(
+            "SELECT * FROM herzchen_identities WHERE authority=? AND kind=? AND id=? AND revision=?",
+            (ref.authority, ref.kind, ref.id, self._revision_key(ref)),
+        ).fetchone()
+
+    def _head_row(self, ref: Any) -> Any:
+        return self.store.conn.execute(
+            "SELECT i.* FROM herzchen_identity_heads h JOIN herzchen_identities i "
+            "ON i.authority=h.authority AND i.kind=h.kind AND i.id=h.id AND i.revision=h.revision "
+            "WHERE h.authority=? AND h.kind=? AND h.id=?",
+            (ref.authority, ref.kind, ref.id),
+        ).fetchone()
+
+    def _identity_from_row(self, row: Any) -> Any:
+        if row is None:
+            return None
+        return IdentityRecord(
+            ResourceRef(str(row["authority"]), str(row["kind"]), str(row["id"]), str(row["revision"]) or None),
+            int(row["version"]),
+            json.loads(row["payload_json"]),
+            row["edit_token"],
+            str(row["created_at"]),
+            str(row["updated_at"]),
+        )
+
+    def _core_identity(self, ref: Any) -> Any:
+        if ref.authority != self.authority:
+            return None
+        try:
+            if ref.kind == "runtime.project":
+                value = self.runtime.get_project(ref.id)
+                version = int(value["version"])
+                payload = {"record_type": "runtime.project", "metadata": dict(value.get("metadata") or {}), "value": value}
+            elif ref.kind == "runtime.shot":
+                value = self.runtime.get_project_shot_by_id(ref.id) if hasattr(self.runtime, "get_project_shot_by_id") else None
+                if value is None:
+                    row = self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (ref.id,)).fetchone()
+                    if row is None:
+                        return None
+                    value = self.runtime._project_shot_resource(row)
+                version = int(value["version"])
+                payload = {"record_type": "runtime.shot", "metadata": dict(value.get("metadata") or {}), "value": value}
+            elif ref.kind == "runtime.task":
+                value = self.runtime.get_task(ref.id)
+                task = value.get("task", value) if isinstance(value, Mapping) else value
+                version = int(task.get("version", 1)) if isinstance(task, Mapping) else 1
+                payload = {"record_type": "runtime.task", "metadata": {}, "value": value}
+            else:
+                return None
+        except Exception:
+            return None
+        current_ref = ResourceRef(self.authority, ref.kind, ref.id, f"runtime-v{version}")
+        if ref.revision is not None and ref.revision != current_ref.revision:
+            return None
+        return IdentityRecord(current_ref, version, payload, None, str(value.get("created_at", "")) if isinstance(value, Mapping) else "", str(value.get("updated_at", "")) if isinstance(value, Mapping) else "")
+
+    def get_identity(self, ref: Any) -> Any:
+        if not isinstance(ref, ResourceRef):
+            return None
+        core = self._core_identity(ref)
+        if core is not None:
+            return core
+        row = self._row_for(ref) if ref.revision is not None else self._head_row(ref)
+        return self._identity_from_row(row)
+
+    def get_reference(self, ref: Any) -> Any:
+        if not isinstance(ref, ResourceRef):
+            return None
+        row = self.store.conn.execute(
+            "SELECT 1 FROM herzchen_references WHERE authority=? AND kind=? AND id=? AND revision=?",
+            (ref.authority, ref.kind, ref.id, self._revision_key(ref)),
+        ).fetchone()
+        return ref if row is not None else None
+
+    def consumer(self) -> _RuntimeGenericReader:
+        return self.reader
+
+    def registered_domains(self) -> tuple[Any, ...]:
+        return tuple(
+            DomainContribution.from_dict(json.loads(row["descriptor_json"]))
+            for row in self.store.conn.execute("SELECT descriptor_json FROM herzchen_domains ORDER BY domain_id").fetchall()
+        )
+
+    def register_domain(self, contribution: Any, **_: Any) -> Any:
+        descriptor = _contract_json(contribution)
+        domain_id = str(contribution.domain_id)
+        existing = self.store.conn.execute("SELECT descriptor_json FROM herzchen_domains WHERE domain_id=?", (domain_id,)).fetchone()
+        if existing is not None:
+            if json.loads(existing["descriptor_json"]) != descriptor:
+                raise RuntimeOperationBindingError("Runtime DAT domain admission differs from the persisted descriptor")
+            return contribution
+        self.store.conn.execute(
+            "INSERT INTO herzchen_domains(domain_id, descriptor_json, created_at) VALUES (?, ?, ?)",
+            (domain_id, canonical_json(descriptor), now()),
+        )
+        return contribution
+
+    def _project_id_for_ref(self, ref: Any, payload: Mapping[str, Any] | None = None) -> str | None:
+        if ref.kind == "runtime.project":
+            return ref.id
+        if ref.kind == "runtime.shot":
+            row = self.store.conn.execute("SELECT project_id FROM project_shots WHERE id=?", (ref.id,)).fetchone()
+            return None if row is None else str(row["project_id"])
+        if ref.kind == "runtime.task":
+            row = self.store.conn.execute("SELECT r.project_id FROM tasks t JOIN runs r ON r.id=t.run_id WHERE t.id=?", (ref.id,)).fetchone()
+            return None if row is None else str(row["project_id"])
+        if payload:
+            document = payload.get("document")
+            scope = getattr(document, "authoring_scope", None)
+            if isinstance(scope, ResourceRef):
+                return scope.id
+            if isinstance(scope, Mapping):
+                return str(scope.get("id")) if scope.get("id") else None
+            raw = payload.get("project_id")
+            if raw:
+                return str(raw)
+        row = self.store.conn.execute("SELECT project_id FROM project_documents WHERE id=?", (ref.id,)).fetchone()
+        return None if row is None else str(row["project_id"])
+
+    def _runtime_receipt(self, result: Any, *, kind: str, aggregate_id: str, key: str, project_id: str | None) -> Mapping[str, Any] | None:
+        if isinstance(result, Mapping) and isinstance(result.get("receipt"), Mapping):
+            return result["receipt"]
+        if project_id:
+            return self.runtime.committed_receipt(kind, aggregate_id, key, project_id=project_id)
+        return None
+
+    def _store_generic_receipt(self, envelope: Any, result: Any, *, runtime_receipt: Mapping[str, Any] | None, project_id: str | None, result_ref: Any, replayed: bool = False) -> Any:
+        command_kind = "herzchen." + str(envelope.operation)
+        aggregate_id = str(envelope.target.id)
+        key = str(envelope.context.logical_request_key)
+        event_ids = tuple(str(item) for item in (runtime_receipt or {}).get("event_ids", ()))
+        transaction_id = str((runtime_receipt or {}).get("receipt_id") or ("txn-" + new_id()))
+        stored_result = {
+            "target": envelope.target,
+            "result_ref": result_ref,
+            "data": result,
+            "transaction_id": transaction_id,
+        }
+        if not replayed:
+            existing = self.store.conn.execute(
+                "SELECT request_hash FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+                (command_kind, aggregate_id, key),
+            ).fetchone()
+            if existing is None:
+                project_seq = (runtime_receipt or {}).get("project_seq") or (None, None)
+                self.store.conn.execute(
+                    "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at, txn_id, first_project_seq, last_project_seq, event_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (command_kind, aggregate_id, key, envelope.context.request_digest, canonical_json(stored_result), now(), transaction_id, project_seq[0], project_seq[-1], canonical_json(list(event_ids))),
+                )
+        status = ReceiptStatus.COMMITTED
+        return CommandReceipt(
+            key,
+            envelope.context.request_digest,
+            envelope.operation,
+            envelope.target,
+            status,
+            transaction_id=transaction_id,
+            event_ids=event_ids,
+            result_ref=result_ref,
+            replayed=replayed,
+            observed_revision=result_ref.revision if isinstance(result_ref, ResourceRef) else envelope.target.revision,
+        )
+
+    def get_receipt(self, logical_request_key: str) -> Any:
+        row = self.store.conn.execute(
+            "SELECT * FROM command_idempotency WHERE command_kind LIKE 'herzchen.%' AND idempotency_key=? ORDER BY rowid DESC LIMIT 1",
+            (logical_request_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        body = json.loads(row["result_json"])
+        target = ResourceRef.from_dict(body["target"])
+        result_ref = ResourceRef.from_dict(body["result_ref"]) if body.get("result_ref") else None
+        return CommandReceipt(
+            logical_request_key,
+            str(row["request_hash"]),
+            str(row["command_kind"])[len("herzchen."):],
+            target,
+            ReceiptStatus.COMMITTED,
+            transaction_id=str(row["txn_id"]),
+            event_ids=tuple(str(value) for value in json.loads(row["event_ids_json"] or "[]")),
+            result_ref=result_ref,
+            observed_revision=result_ref.revision if result_ref is not None else target.revision,
+        )
+
+    def _put_row(self, ref: Any, payload: Mapping[str, Any], *, version: int, edit_token: str | None = None) -> Any:
+        stamp = now()
+        revision = self._revision_key(ref)
+        encoded = canonical_json(_contract_json(payload))
+        self.store.conn.execute(
+            "INSERT OR REPLACE INTO herzchen_identities(authority, kind, id, revision, version, payload_json, edit_token, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM herzchen_identities WHERE authority=? AND kind=? AND id=? AND revision=?), ?), ?)",
+            (ref.authority, ref.kind, ref.id, revision, int(version), encoded, edit_token, ref.authority, ref.kind, ref.id, revision, stamp, stamp),
+        )
+        return self.get_identity(ref)
+
+    def _put_head(self, ref: Any, payload: Mapping[str, Any], *, version: int, edit_token: str | None = None) -> Any:
+        self._put_row(ref, payload, version=version, edit_token=edit_token)
+        revision = self._revision_key(ref)
+        self.store.conn.execute(
+            "INSERT OR REPLACE INTO herzchen_identity_heads(authority, kind, id, revision, version, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (ref.authority, ref.kind, ref.id, revision, int(version), now()),
+        )
+        return self.get_identity(ResourceRef(ref.authority, ref.kind, ref.id))
+
+    def put_identity(self, ref: Any, payload: Mapping[str, Any], *, version: int = 1, transaction: Any = None, **_: Any) -> Any:
+        self._require_transaction(transaction)
+        return self._put_row(ref, payload, version=version)
+
+    def revise_identity(self, current_ref: Any, payload: Mapping[str, Any], *, revision: str, expected_revision: str | None = None, expected_version: int | None = None, expected_edit_token: str | None = None, transaction: Any = None, **_: Any) -> Any:
+        self._require_transaction(transaction)
+        current = self.get_identity(current_ref)
+        if current is None:
+            raise RuntimeOperationBindingError("generic identity to revise was not found")
+        if expected_revision is not None and current.ref.revision != expected_revision:
+            raise RuntimeOperationBindingError("generic identity revision conflict")
+        if expected_version is not None and current.version != expected_version:
+            raise RuntimeOperationBindingError("generic identity version conflict")
+        next_ref = ResourceRef(current.ref.authority, current.ref.kind, current.ref.id, revision)
+        return self._put_head(next_ref, payload, version=current.version + 1, edit_token=expected_edit_token)
+
+    def put_reference(self, ref: Any, *, transaction: Any = None) -> Any:
+        self._require_transaction(transaction)
+        self.store.conn.execute(
+            "INSERT OR IGNORE INTO herzchen_references(authority, kind, id, revision, created_at) VALUES (?, ?, ?, ?, ?)",
+            (ref.authority, ref.kind, ref.id, self._revision_key(ref), now()),
+        )
+        return ref
+
+    def _delegate_core(self, envelope: Any) -> tuple[Any, Mapping[str, Any] | None, str | None]:
+        payload = envelope.payload
+        project_id = self._project_id_for_ref(envelope.target, payload)
+        key = str(envelope.context.logical_request_key)
+        operation = str(envelope.operation)
+        if operation == "dat.content.document.create":
+            document = payload["document"]
+            revision = payload["revision"]
+            project_id = self._project_id_for_ref(envelope.target, payload)
+            result = self.runtime.create_document(project_id, {"document_id": document.ref.id, "kind": document.role, "content": revision.content}, idempotency_key=key)
+            return result.get("data", result) if isinstance(result, Mapping) else result, self._runtime_receipt(result, kind="document.create", aggregate_id=document.ref.id, key=key, project_id=project_id), project_id
+        if operation == "dat.content.revision.append":
+            document = payload["document"]
+            revision = payload["revision"]
+            current = self.runtime.get_document(project_id, document.ref.id)
+            result = self.runtime.update_document(project_id, document.ref.id, {"expected_version": int(current["version"]), "content": revision.content, "kind": document.role}, idempotency_key=key)
+            return result.get("data", result) if isinstance(result, Mapping) else result, self._runtime_receipt(result, kind="document.update", aggregate_id=document.ref.id, key=key, project_id=project_id), project_id
+        if operation.startswith("dat.extensions.metadata."):
+            subject = envelope.target
+            next_payload = payload
+            if subject.kind == "runtime.project":
+                result = self.runtime.update_project(subject.id, {"expected_version": int(envelope.context.expected_version), "metadata": next_payload.get("metadata", {})}, idempotency_key=key)
+                return result, self._runtime_receipt(result, kind="project.update", aggregate_id=subject.id, key=key, project_id=project_id), project_id
+            if subject.kind == "runtime.shot":
+                result = self.runtime.update_project_shot(project_id, subject.id, {"expected_version": int(envelope.context.expected_version), "metadata": next_payload.get("metadata", {})}, idempotency_key=key)
+                return result.get("data", result) if isinstance(result, Mapping) else result, self._runtime_receipt(result, kind="shot.update", aggregate_id=subject.id, key=key, project_id=project_id), project_id
+            version = int(envelope.context.expected_version or 0) + 1
+            self._put_head(subject, next_payload, version=version)
+            return next_payload, None, project_id
+        return payload, None, project_id
+
+    def mutate(self, envelope: Any, *, result_ref: Any = None, before_refs: tuple[Any, ...] = (), after_refs: tuple[Any, ...] = (), effects: Mapping[str, Any] | None = None, transaction: Any = None, identity_payload: Mapping[str, Any] | None = None, **_: Any) -> Any:
+        self._require_transaction(transaction)
+        prior = self.get_receipt(envelope.context.logical_request_key)
+        if prior is not None:
+            if prior.request_digest != envelope.context.request_digest:
+                raise RuntimeOperationBindingError("generic logical request key was reused with changed input")
+            return replace(prior, replayed=True)
+        result, runtime_receipt, project_id = self._delegate_core(envelope)
+        final_ref = result_ref or envelope.target
+        if identity_payload is not None and isinstance(final_ref, ResourceRef) and final_ref.revision is not None:
+            version = int(envelope.context.expected_version or 0) + 1
+            self._put_head(envelope.target, identity_payload, version=max(1, version))
+        if envelope.operation in {"dat.content.link", "dat.content.unlink"}:
+            association = envelope.payload.get("association")
+            if association is not None:
+                self._put_row(envelope.target, {"record_type": "dat.content.association", "association": _contract_json(association), "active": envelope.operation.endswith("link")}, version=1)
+                self.store.conn.execute("INSERT OR IGNORE INTO herzchen_references(authority, kind, id, revision, created_at) VALUES (?, ?, ?, ?, ?)", (envelope.target.authority, envelope.target.kind, envelope.target.id, "", now()))
+        return self._store_generic_receipt(envelope, result, runtime_receipt=runtime_receipt, project_id=project_id, result_ref=final_ref)
+
+
 @dataclass
 class RuntimeTaskOperationBinding:
     """One shared task request bound to Runtime's existing owner transaction.
@@ -505,6 +858,25 @@ class RuntimeHerzchenBridge:
         )
         self._operation_owner_capability = issue_operation_owner(self._operation_owner)
         self.operation_manager = OperationManager(self._operation_owner)
+        if ContentCommandHandler is None or ExtensionCommandService is None:
+            raise HerzchenUnavailable("the installed Herzchen package lacks DAT content/extension contracts")
+        self._generic_writer = _RuntimeGenericWriter(self)
+        self.content = None
+        self.extensions = None
+        self.generic_contract_error = None
+        try:
+            self.content = ContentCommandHandler(self._generic_writer)
+            self.extensions = ExtensionCommandService(self._generic_writer)
+        except StoreAdmissionError as exc:
+            # Keep the already-proven operation bridge usable while the
+            # installed shared command facade lacks the foreign Runtime
+            # domain-owner capability.  Do not counterfeit DAT support or
+            # widen the local adapter into a second Store.
+            self.generic_contract_error = HerzchenUnavailable(
+                "the installed Herzchen command facade cannot issue DAT ports over the Runtime owner"
+            )
+            self.content = None
+            self.extensions = None
 
     @property
     def actor(self) -> Any:

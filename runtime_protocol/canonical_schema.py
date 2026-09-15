@@ -5,7 +5,7 @@ is created explicitly from this format; an existing database must already
 match it and is never upgraded while being opened or inspected.
 """
 
-CANONICAL_FORMAT_ID = "astrid-runtime-sqlite-v1"
+CANONICAL_FORMAT_ID = "astrid-runtime-sqlite-v2"
 
 CANONICAL_SCHEMA_SQL = r"""
 CREATE TABLE runtime_schema (
@@ -157,6 +157,28 @@ CREATE TABLE command_idempotency (
     txn_id TEXT, primary_stream_id TEXT, resulting_stream_seq INTEGER,
     first_project_seq INTEGER, last_project_seq INTEGER, event_ids_json TEXT,
     PRIMARY KEY(command_kind, aggregate_id, idempotency_key)
+);
+CREATE TABLE herzchen_domains (
+    domain_id TEXT PRIMARY KEY, descriptor_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE herzchen_identities (
+    authority TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    revision TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL, edit_token TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(authority, kind, id, revision)
+);
+CREATE TABLE herzchen_identity_heads (
+    authority TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    revision TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(authority, kind, id),
+    FOREIGN KEY(authority, kind, id, revision)
+      REFERENCES herzchen_identities(authority, kind, id, revision)
+);
+CREATE TABLE herzchen_references (
+    authority TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+    revision TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+    PRIMARY KEY(authority, kind, id, revision)
 );
 CREATE TABLE project_shots (
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
