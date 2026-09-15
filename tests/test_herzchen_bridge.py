@@ -61,6 +61,12 @@ def test_runtime_owner_consumes_shared_contracts_without_second_store() -> None:
                 target=project_ref,
             )
             assert replay is not None and replay.shared_receipt.replayed is True
+            noop = bridge.receipt(
+                {"receipt_id": "noop-1", "status": "no-op"},
+                request=request,
+                target=project_ref,
+            )
+            assert noop is not None and noop.shared_receipt.status.value == "no-op"
             failed = bridge.receipt(
                 {"receipt_id": "failure-1", "status": "failed", "error_code": "runtime_failed"},
                 request=request,
