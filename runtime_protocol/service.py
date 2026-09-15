@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
+from .herzchen_bridge import HerzchenUnavailable, RuntimeHerzchenBridge
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
 
@@ -415,6 +416,14 @@ class RuntimeService:
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
         self._recover_cas_publication_journals()
+        # When the pinned shared package is present, expose the actual
+        # Runtime-owner binding used by Astrid/Herzchen consumers.  The
+        # standalone Runtime distribution remains valid without that optional
+        # package; no second store or writer is created in either case.
+        try:
+            self.herzchen = RuntimeHerzchenBridge(self)
+        except HerzchenUnavailable:
+            self.herzchen = None
 
     def close(self):
         self.store.close()

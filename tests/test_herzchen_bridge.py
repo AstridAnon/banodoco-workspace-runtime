@@ -19,6 +19,7 @@ def test_runtime_owner_consumes_shared_contracts_without_second_store() -> None:
         runtime = RuntimeService(root, realm_id="bridge-realm")
         try:
             bridge = RuntimeHerzchenBridge(runtime)
+            assert runtime.herzchen is bridge or type(runtime.herzchen) is type(bridge)
             project = bridge.runtime.create_project(
                 {"name": "Herzchen bridge", "slug": "herzchen-bridge"},
                 idempotency_key="bridge-project-1",
