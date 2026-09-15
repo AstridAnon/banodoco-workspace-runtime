@@ -1198,9 +1198,11 @@ class RealmStore:
             )
         return normalized
 
-    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
+    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, _shared_operation=None):
         if not capability:
             raise ValidationError("capability is required")
+        if _shared_operation is not None and not idempotency_key:
+            raise ValidationError("shared task operation requires an idempotency key")
         if isinstance(spec, dict) and "required_facts" in spec:
             spec = dict(spec)
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
@@ -1246,16 +1248,29 @@ class RealmStore:
                     raise ConflictError("generation.publish_v1 requires a project-scoped task")
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
-                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                runtime_request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                request_hash = runtime_request_hash
+                if _shared_operation is not None:
+                    # EX-OPS supplies the admitted logical identity.  Runtime
+                    # keeps its task-specific validation and schema, but the
+                    # one command ledger now keys this mutation by the same
+                    # shared request digest.
+                    request_hash = str(_shared_operation.request_digest)
                 aggregate_id = project_id or "unscoped"
                 if idempotency_key:
                     receipt = self.conn.execute(
-                        "SELECT result_json, request_hash FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                        "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, first_project_seq, last_project_seq, event_ids_json, created_at FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
                         (aggregate_id, idempotency_key),
                     ).fetchone()
                     if receipt:
                         if receipt["request_hash"] != request_hash:
                             raise ConflictError("idempotency key was already used with different input")
+                        if _shared_operation is not None:
+                            _shared_operation.bind_receipt(
+                                self._command_receipt_from_row(receipt, project_id=project_id or "unscoped"),
+                                replayed=True,
+                            )
+                            _shared_operation.require_bound()
                         return json.loads(receipt["result_json"])
                 if idempotency_key:
                     old = self.conn.execute("SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?", (project_id, idempotency_key)).fetchone()
@@ -1269,6 +1284,16 @@ class RealmStore:
                             "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                             ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), old["created_at"]),
                         )
+                        if _shared_operation is not None:
+                            receipt = self.conn.execute(
+                                "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, first_project_seq, last_project_seq, event_ids_json, created_at FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                                (aggregate_id, idempotency_key),
+                            ).fetchone()
+                            _shared_operation.bind_receipt(
+                                self._command_receipt_from_row(receipt, project_id=project_id or "unscoped"),
+                                replayed=True,
+                            )
+                            _shared_operation.require_bound()
                         return result
                 registered = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability,)).fetchone()
                 if registered:
@@ -1334,6 +1359,16 @@ class RealmStore:
                         result, project_id=project_id or "unscoped", event_ids=event_ids,
                         primary_stream_id=run_id, resulting_stream_seq=len(event_ids), created_at=timestamp,
                     )
+                    if _shared_operation is not None:
+                        receipt = self.conn.execute(
+                            "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, first_project_seq, last_project_seq, event_ids_json, created_at FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                            (aggregate_id, idempotency_key),
+                        ).fetchone()
+                        _shared_operation.bind_receipt(
+                            self._command_receipt_from_row(receipt, project_id=project_id or "unscoped"),
+                            replayed=False,
+                        )
+                        _shared_operation.require_bound()
                 return result
 
     @staticmethod
@@ -1628,6 +1663,23 @@ class RealmStore:
             ),
         )
         return txn_id
+
+    @staticmethod
+    def _command_receipt_from_row(row, *, project_id):
+        """Project an already-written Runtime ledger row for an owner binding."""
+        if row is None or row["txn_id"] is None:
+            raise ConflictError("Runtime command ledger row has no committed transaction")
+        return {
+            "receipt_id": row["txn_id"],
+            "command_kind": row["command_kind"],
+            "idempotency_key": row["idempotency_key"],
+            "request_hash": row["request_hash"],
+            "project_id": project_id,
+            "project_seq": [int(row["first_project_seq"]), int(row["last_project_seq"])],
+            "event_ids": json.loads(row["event_ids_json"]),
+            "result": json.loads(row["result_json"]),
+            "created_at": row["created_at"],
+        }
 
     @staticmethod
     def _waiting_for_resource(resource_key):

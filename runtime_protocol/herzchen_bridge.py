@@ -65,6 +65,56 @@ class RuntimeReceiptBinding:
     runtime_receipt: Mapping[str, Any]
 
 
+class RuntimeOperationBindingError(RuntimeError):
+    """The shared request/receipt binding was not completed by Runtime."""
+
+
+@dataclass
+class RuntimeTaskOperationBinding:
+    """One shared task request bound to Runtime's existing owner transaction.
+
+    Herzchen's qualified ``OperationManager`` owns a Herzchen ``Store`` and
+    cannot be pointed at Runtime's task schema.  This small owner-side seam
+    therefore carries only the common request identity and typed receipt
+    contract into Runtime's already-authoritative transaction.  It never
+    opens a second store or writes a second operation ledger.
+    """
+
+    bridge: "RuntimeHerzchenBridge"
+    request: Any
+    target: Any
+    _receipt_binding: RuntimeReceiptBinding | None = None
+
+    @property
+    def request_digest(self) -> str:
+        return str(self.request.request_digest)
+
+    @property
+    def receipt_binding(self) -> RuntimeReceiptBinding | None:
+        return self._receipt_binding
+
+    def bind_receipt(self, runtime_receipt: Mapping[str, Any], *, replayed: bool = False) -> RuntimeReceiptBinding:
+        if self._receipt_binding is not None:
+            raise RuntimeOperationBindingError("Runtime shared receipt binding was invoked twice")
+        binding = self.bridge.receipt(
+            runtime_receipt,
+            request=self.request,
+            target=self.target,
+            replayed=replayed,
+        )
+        if binding is None:
+            raise RuntimeOperationBindingError("Runtime committed task receipt could not be projected")
+        self._receipt_binding = binding
+        return binding
+
+    def require_bound(self) -> RuntimeReceiptBinding:
+        if self._receipt_binding is None:
+            raise RuntimeOperationBindingError(
+                "Runtime task mutation bypassed the shared Herzchen receipt binding"
+            )
+        return self._receipt_binding
+
+
 class RuntimeHerzchenBridge:
     """Thin shared-contract ports over one admitted ``RuntimeService`` owner."""
 
@@ -93,9 +143,14 @@ class RuntimeHerzchenBridge:
         return ResourceRef(self.authority, kind, str(value), revision)
 
     def project_ref(self, project_id: str) -> Any:
-        """Resolve and retain Runtime's canonical project identity."""
+        """Resolve the stable canonical Runtime project identity.
+
+        Operation identity must replay after unrelated project edits, so the
+        operation target is deliberately unpinned.  Runtime's own command
+        receipt retains the concrete project sequence/version facts.
+        """
         project = self.runtime.get_project(project_id)
-        return self._ref("runtime.project", project["id"], revision=f"runtime-v{int(project['version'])}")
+        return self._ref("runtime.project", project["id"])
 
     def task_ref(self, task_id: str) -> Any:
         task = self.runtime.get_task(task_id)
@@ -149,6 +204,26 @@ class RuntimeHerzchenBridge:
             external_owner_ref=external_owner,
         )
         return request.canonicalized(target)
+
+    def task_operation(self, body: Mapping[str, Any]) -> RuntimeTaskOperationBinding:
+        """Admit one task request identity before Runtime opens its writer tx."""
+        if not isinstance(body, Mapping):
+            raise TypeError("task body must be a mapping")
+        project_id = body.get("project")
+        idempotency_key = body.get("idempotency_key")
+        if not project_id or not idempotency_key:
+            raise RuntimeOperationBindingError(
+                "shared task binding requires project and idempotency_key"
+            )
+        target = self.project_ref(str(project_id))
+        request = self.operation(
+            "task.admit",
+            logical_request_key=str(idempotency_key),
+            target=target,
+            payload=dict(body),
+            project_id=target.id,
+        )
+        return RuntimeTaskOperationBinding(self, request, target)
 
     def receipt(
         self,
@@ -229,8 +304,14 @@ class RuntimeHerzchenBridge:
     def read_object(self, object_id: str) -> Any:
         return self.runtime.object(object_id)
 
-    def admit_task(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self.runtime.create_task(dict(body))
+    def admit_task(self, body: Mapping[str, Any], *, enforce_readiness: bool = False) -> Mapping[str, Any]:
+        """Route the production task caller through the owner binding."""
+        binding = self.task_operation(body)
+        return self.runtime._create_task_from_shared(
+            dict(body),
+            enforce_readiness=enforce_readiness,
+            shared_operation=binding,
+        )
 
     def claim_next(self, body: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
         return self.runtime.claim_next(dict(body), idempotency_key=idempotency_key)

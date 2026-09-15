@@ -2495,23 +2495,41 @@ class RuntimeService:
 
     @_verified_mutation
     def create_task(self, body, *, enforce_readiness=False):
+        if (
+            self.herzchen is not None
+            and body.get("project")
+            and body.get("idempotency_key")
+        ):
+            # The production caller enters through the shared owner seam.  It
+            # returns here only after Runtime's sole transaction has bound the
+            # shared request identity and receipt.
+            return self.herzchen.admit_task(
+                dict(body),
+                enforce_readiness=enforce_readiness,
+            )
+        return self._create_task_core(
+            body,
+            enforce_readiness=enforce_readiness,
+            shared_operation=None,
+        )
+
+    def _create_task_from_shared(self, body, *, enforce_readiness=False, shared_operation):
+        """Trusted owner seam used by the typed Herzchen bridge.
+
+        The bridge supplies identity; this service retains Runtime's mutation
+        admission fence and owns the transaction boundary.
+        """
+        with self.store._mutex:
+            self._assert_mutation_admitted()
+            return self._create_task_core(
+                body,
+                enforce_readiness=enforce_readiness,
+                shared_operation=shared_operation,
+            )
+
+    def _create_task_core(self, body, *, enforce_readiness=False, shared_operation=None):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
-        shared_request = None
-        shared_target = None
-        project_selector = body.get("project")
-        idempotency_key = body.get("idempotency_key")
-        if self.herzchen is not None and project_selector and idempotency_key:
-            # This is the live consumer path: Herzchen fixes operation
-            # identity/context, while Runtime remains the sole task writer.
-            shared_target = self.herzchen.project_ref(project_selector)
-            shared_request = self.herzchen.operation(
-                "task.admit",
-                logical_request_key=str(idempotency_key),
-                target=shared_target,
-                payload=dict(body),
-                project_id=shared_target.id,
-            )
         capability = body.get("capability_id")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
@@ -2525,19 +2543,21 @@ class RuntimeService:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
-        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness)
-        if shared_request is not None and shared_target is not None:
-            runtime_receipt = self.committed_receipt(
-                "task.create",
-                shared_target.id,
-                str(idempotency_key),
-                project_id=shared_target.id,
-            )
-            self.herzchen.receipt(
-                {"receipt": runtime_receipt},
-                request=shared_request,
-                target=shared_target,
-            )
+        value = self.store.create_task(
+            capability,
+            task_spec,
+            body.get("project"),
+            body.get("idempotency_key"),
+            body.get("settlement_effect"),
+            digest,
+            enforce_readiness=enforce_readiness,
+            _shared_operation=shared_operation,
+        )
+        if shared_operation is not None:
+            # RealmStore asserts this before its transaction commits.  Keep a
+            # second owner-side assertion here so any future bypass is loud at
+            # the production service seam as well.
+            shared_operation.require_bound()
         return value
 
     def task(self, task_id):
