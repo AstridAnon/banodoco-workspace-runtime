@@ -13,7 +13,10 @@ shared binding without the controller's pinned Herzchen installation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+import hashlib
+import json
 from typing import Any, Mapping, Optional
 
 
@@ -26,22 +29,36 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
     from herzchen.contracts import (
         AuthenticatedActor,
         CommandReceipt,
+        DomainContribution,
         EventEnvelope,
         ReceiptStatus,
         ResourceRef,
+        canonical_json,
+        validate_replay,
     )
     from herzchen.kernel.operations import (
         OPERATION_SCHEMA_REVISION,
+        OperationManager,
         OperationRequest,
         request_digest,
+    )
+    from herzchen.kernel.store import (
+        IdentityRecord,
+        RuntimeOperationOwner as HerzchenRuntimeOperationOwner,
+        RuntimeOperationReader as HerzchenRuntimeOperationReader,
+        issue_operation_owner,
     )
     _HERZCHEN_IMPORT_ERROR: Optional[BaseException] = None
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised by standalone installs
     HerzchenHostAdapter = None  # type: ignore[assignment]
-    AuthenticatedActor = CommandReceipt = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
+    AuthenticatedActor = CommandReceipt = DomainContribution = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
+    canonical_json = validate_replay = None  # type: ignore[assignment]
     OPERATION_SCHEMA_REVISION = "fnd-04.operation.v1"
+    OperationManager = None  # type: ignore[assignment]
     OperationRequest = None  # type: ignore[assignment]
     request_digest = None  # type: ignore[assignment]
+    IdentityRecord = None  # type: ignore[assignment]
+    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = issue_operation_owner = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR = exc
 
 
@@ -69,21 +86,355 @@ class RuntimeOperationBindingError(RuntimeError):
     """The shared request/receipt binding was not completed by Runtime."""
 
 
+_RUNTIME_OPERATION_COMMAND = "herzchen.operation"
+_RUNTIME_OPERATION_STREAM = "operations"
+
+
+def _runtime_descriptor_digest(descriptors: tuple[Any, ...]) -> str:
+    """Match FND's canonical descriptor digest without importing its internals."""
+    ordered = sorted(descriptors, key=lambda descriptor: descriptor.domain_id)
+    return hashlib.sha256(canonical_json([descriptor.to_dict() for descriptor in ordered]).encode("utf-8")).hexdigest()
+
+
+if HerzchenRuntimeOperationOwner is not None:
+
+    class _RuntimeOperationReader(HerzchenRuntimeOperationReader):
+        """Finite read-only view over the existing Runtime owner."""
+
+        __slots__ = ("_owner",)
+
+        def __init__(self, owner: "_RuntimeOperationOwner") -> None:
+            self._owner = owner
+
+        @property
+        def authority(self) -> str:
+            return self._owner.authority
+
+        @property
+        def domain_descriptor_digest(self) -> str:
+            return self._owner.domain_descriptor_digest
+
+        def registered_domains(self) -> tuple[Any, ...]:
+            return self._owner.registered_domains()
+
+        def get_identity(self, ref: Any) -> Any:
+            return self._owner.get_identity(ref)
+
+        def get_receipt(self, logical_request_key: str) -> Any:
+            return self._owner.get_receipt(logical_request_key)
+
+        def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
+            return self._owner.list_events(stream=stream)
+
+
+    class _RuntimeTransaction:
+        """Identity wrapper for one already-open Runtime transaction/savepoint."""
+
+        __slots__ = ("owner", "connection")
+
+        def __init__(self, owner: "_RuntimeOperationOwner") -> None:
+            self.owner = owner
+            self.connection = owner._store.conn
+
+
+    class _RuntimeOperationOwner(HerzchenRuntimeOperationOwner):
+        """FND owner capability backed by Runtime's existing SQLite authority."""
+
+        __slots__ = ("_runtime", "_store", "_authority", "_actor", "reader", "_domains", "_domain_digest")
+
+        def __init__(self, runtime: Any, *, authority: str, actor: Any) -> None:
+            self._runtime = runtime
+            self._store = getattr(runtime, "store")
+            self._authority = authority
+            self._actor = actor
+            self._domains = (
+                DomainContribution(
+                    "runtime.operation",
+                    "v1",
+                    "Runtime",
+                    ("operation", "runtime.project", "runtime.task"),
+                    (),
+                    (),
+                    ("task.admit",),
+                    ("operation.prepared", "operation.outcome"),
+                    "runtime.operation.v1",
+                    ("runtime.task",),
+                ),
+            )
+            self._domain_digest = _runtime_descriptor_digest(self._domains)
+            self.reader = _RuntimeOperationReader(self)
+
+        @property
+        def authority(self) -> str:
+            return self._authority
+
+        @property
+        def domain_descriptor_digest(self) -> str:
+            return self._domain_digest
+
+        def registered_domains(self) -> tuple[Any, ...]:
+            return self._domains
+
+        @contextmanager
+        def transaction(self):
+            with self._store._transaction():
+                yield _RuntimeTransaction(self)
+
+        def _require_transaction(self, transaction: Any) -> _RuntimeTransaction:
+            if not isinstance(transaction, _RuntimeTransaction) or transaction.owner is not self:
+                raise RuntimeOperationBindingError("FND operation mutation must use the active Runtime owner transaction")
+            if not self._store.conn.in_transaction:
+                raise RuntimeOperationBindingError("Runtime owner transaction is no longer active")
+            return transaction
+
+        def _operation_row(self, logical_request_key: str, *, target_id: str | None = None):
+            if target_id is None:
+                return self._store.conn.execute(
+                    "SELECT rowid, * FROM command_idempotency WHERE command_kind=? AND idempotency_key=? ORDER BY rowid DESC LIMIT 1",
+                    (_RUNTIME_OPERATION_COMMAND, logical_request_key),
+                ).fetchone()
+            return self._store.conn.execute(
+                "SELECT rowid, * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=? ORDER BY rowid DESC LIMIT 1",
+                (_RUNTIME_OPERATION_COMMAND, target_id, logical_request_key),
+            ).fetchone()
+
+        @staticmethod
+        def _operation_body(row: Any) -> Mapping[str, Any]:
+            if row is None:
+                return {}
+            value = json.loads(row["result_json"])
+            return value if isinstance(value, Mapping) else {}
+
+        def _operation_event(self, row: Any) -> Any:
+            body = self._operation_body(row)
+            event_id = str(body.get("event_id"))
+            event = self._store.conn.execute("SELECT * FROM events WHERE id=?", (int(event_id),)).fetchone()
+            if event is None:
+                raise RuntimeOperationBindingError("Runtime operation event lineage is missing")
+            metadata = json.loads(event["payload_json"]).get("__herzchen__")
+            if not isinstance(metadata, Mapping):
+                raise RuntimeOperationBindingError("Runtime operation event metadata is missing")
+            return self._event_from_metadata(event, metadata)
+
+        def _event_from_metadata(self, event: Any, metadata: Mapping[str, Any]) -> Any:
+            return EventEnvelope(
+                str(event["id"]),
+                self.authority,
+                str(metadata["stream"]),
+                ResourceRef.from_dict(metadata["subject"]),
+                str(metadata["schema_revision"]),
+                str(metadata["event_type"]),
+                int(event["id"]),
+                AuthenticatedActor.from_dict(metadata["actor"]),
+                str(metadata["operation"]),
+                metadata.get("correlation_id"),
+                metadata.get("causation_id"),
+                str(event["created_at"]),
+                str(event["created_at"]),
+                tuple(ResourceRef.from_dict(value) for value in metadata.get("before_refs", ())),
+                tuple(ResourceRef.from_dict(value) for value in metadata.get("after_refs", ())),
+                metadata.get("effects", {}),
+            )
+
+        def _validate_envelope(self, envelope: Any, *, event_type: str, target: Any) -> None:
+            if envelope.target != target or target.authority != self.authority or target.kind != "operation":
+                raise RuntimeOperationBindingError("Runtime operation target is outside the admitted owner domain")
+            if envelope.context.actor != self._actor:
+                raise RuntimeOperationBindingError("Runtime operation actor is not the admitted Runtime owner actor")
+            if envelope.operation == "task.admit":
+                expected_event = "operation.prepared"
+            elif envelope.operation == "operation.outcome":
+                expected_event = "operation.outcome"
+            else:
+                raise RuntimeOperationBindingError("Runtime operation name is not admitted")
+            if event_type != expected_event:
+                raise RuntimeOperationBindingError("Runtime operation event is not admitted for the operation")
+            if not isinstance(envelope.payload, Mapping) or envelope.payload.get("record_type") != "operation":
+                raise RuntimeOperationBindingError("Runtime operation payload is not an admitted operation record")
+            payload_key = envelope.payload.get("logical_request_key")
+            expected_key = envelope.context.logical_request_key
+            if envelope.operation == "operation.outcome":
+                expected_key = expected_key.split(":outcome", 1)[0]
+            if payload_key != expected_key:
+                raise RuntimeOperationBindingError("Runtime operation logical key is not bound to its envelope")
+            if not isinstance(envelope.payload.get("request_digest"), str):
+                raise RuntimeOperationBindingError("Runtime operation payload is missing its canonical request digest")
+
+        def _task_for_operation(self, envelope: Any) -> Any:
+            request_payload = envelope.payload.get("request_payload")
+            project_id = request_payload.get("project") if isinstance(request_payload, Mapping) else None
+            if not project_id:
+                raise RuntimeOperationBindingError("Runtime operation is missing its project owner")
+            row = self._store.conn.execute(
+                "SELECT r.id AS run_id, t.id AS task_id FROM runs r JOIN tasks t ON t.run_id=r.id WHERE r.project_id=? AND r.idempotency_key=?",
+                (str(project_id), envelope.context.logical_request_key.split(":outcome", 1)[0]),
+            ).fetchone()
+            if row is None:
+                raise RuntimeOperationBindingError("Runtime operation has no admitted Runtime task owner")
+            return row
+
+        def mutate(self, envelope: Any, *, event_type: str, result_ref: Any = None, before_refs: tuple[Any, ...] = (), after_refs: tuple[Any, ...] = (), effects: Mapping[str, Any] | None = None, stream: str | None = None, event_schema_revision: str = "fnd-03.event.v1", occurred_at: str | None = None, no_op: bool = False, transaction: Any = None) -> Any:
+            tx = self._require_transaction(transaction)
+            target = result_ref if result_ref is not None else envelope.target
+            self._validate_envelope(envelope, event_type=event_type, target=envelope.target)
+            if stream != _RUNTIME_OPERATION_STREAM:
+                raise RuntimeOperationBindingError("Runtime operation stream is not admitted")
+            prior = self.get_receipt(envelope.context.logical_request_key)
+            if prior is not None:
+                validate_replay(prior, envelope)
+                return replace(prior, replayed=True)
+            task = self._task_for_operation(envelope)
+            operation_effects = dict(effects or {})
+            metadata = {
+                "stream": _RUNTIME_OPERATION_STREAM,
+                "subject": envelope.target.to_dict(),
+                "schema_revision": event_schema_revision,
+                "event_type": event_type,
+                "actor": envelope.context.actor.to_dict(),
+                "operation": envelope.operation,
+                "correlation_id": envelope.context.correlation_id,
+                "causation_id": envelope.context.causation_id,
+                "before_refs": [ref.to_dict() for ref in before_refs],
+                "after_refs": [ref.to_dict() for ref in after_refs],
+                "effects": operation_effects,
+            }
+            event_id = self._store._append_event(task["run_id"], task["task_id"], event_type, {"__herzchen__": metadata})
+            operation_result = {
+                "record_type": "operation",
+                "event_id": str(event_id),
+                "event_type": event_type,
+                "operation": envelope.operation,
+                "schema_revision": envelope.schema_revision,
+                "logical_request_key": envelope.context.logical_request_key,
+                "request_digest": envelope.context.request_digest,
+                "target": envelope.target.to_dict(),
+                "effects": operation_effects,
+            }
+            txn_id = self._store._record_command_receipt(
+                _RUNTIME_OPERATION_COMMAND,
+                envelope.target.id,
+                envelope.context.logical_request_key,
+                envelope.context.request_digest,
+                operation_result,
+                project_id=str(envelope.payload["request_payload"]["project"]),
+                event_ids=(event_id,),
+                primary_stream_id=task["run_id"],
+                resulting_stream_seq=int(event_id),
+            )
+            row = self._operation_row(envelope.context.logical_request_key, target_id=envelope.target.id)
+            return CommandReceipt(
+                envelope.context.logical_request_key,
+                envelope.context.request_digest,
+                envelope.operation,
+                envelope.target,
+                ReceiptStatus.NOOP if no_op else ReceiptStatus.COMMITTED,
+                transaction_id=txn_id,
+                event_ids=(str(event_id),),
+                result_ref=target,
+                replayed=False,
+                observed_revision=target.revision,
+            )
+
+        def get_identity(self, ref: Any) -> Any:
+            if not isinstance(ref, ResourceRef) or ref.authority != self.authority or ref.kind != "operation":
+                return None
+            row = self._store.conn.execute(
+                "SELECT rowid, * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? ORDER BY rowid DESC LIMIT 1",
+                (_RUNTIME_OPERATION_COMMAND, ref.id),
+            ).fetchone()
+            if row is None:
+                return None
+            body = self._operation_body(row)
+            event = self._operation_event(row)
+            effects = dict(event.effects)
+            revision = body.get("target", {}).get("revision") or "rev-{}".format(int(effects.get("version", 1)))
+            payload = {
+                "record_type": "operation",
+                "operation": body.get("operation", "task.admit"),
+                "schema_revision": body.get("schema_revision", OPERATION_SCHEMA_REVISION),
+                "adapter_ref": effects.get("adapter_ref"),
+                "request_actor": effects.get("request_actor"),
+                "logical_request_key": effects.get("logical_request_key", ref.id),
+                "request_digest": effects.get("request_digest", row["request_hash"]),
+                "request_payload": effects.get("request_payload", {}),
+                "physical_invocation_ref": effects.get("physical_invocation_ref"),
+                "external_owner_ref": effects.get("external_owner_ref"),
+                "expected_revision": effects.get("expected_revision"),
+                "expected_version": effects.get("expected_version"),
+                "edit_token": effects.get("edit_token"),
+                "correlation_id": effects.get("correlation_id"),
+                "causation_id": effects.get("causation_id"),
+                "state": effects.get("state", "prepared"),
+                "result": effects.get("result", {}),
+            }
+            return IdentityRecord(
+                ResourceRef(self.authority, "operation", ref.id, revision),
+                int(effects.get("version", 1)),
+                payload,
+                None,
+                str(row["created_at"]),
+                str(row["created_at"]),
+            )
+
+        def get_receipt(self, logical_request_key: str) -> Any:
+            row = self._operation_row(logical_request_key)
+            if row is None:
+                return None
+            body = self._operation_body(row)
+            target = ResourceRef.from_dict(body["target"])
+            effects = body.get("effects", {})
+            return CommandReceipt(
+                logical_request_key,
+                str(row["request_hash"]),
+                str(body.get("operation", "task.admit")),
+                target,
+                ReceiptStatus.COMMITTED,
+                transaction_id=str(row["txn_id"]),
+                event_ids=tuple(str(value) for value in json.loads(row["event_ids_json"] or "[]")),
+                result_ref=target,
+                observed_revision=target.revision,
+            )
+
+        def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
+            rows = self._store.conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+            values = []
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                metadata = payload.get("__herzchen__") if isinstance(payload, Mapping) else None
+                if not isinstance(metadata, Mapping):
+                    continue
+                if stream is not None and metadata.get("stream") != stream:
+                    continue
+                values.append(self._event_from_metadata(row, metadata))
+            return tuple(values)
+
+        def lookup_replay(self, envelope: Any) -> Any:
+            prior = self.get_receipt(envelope.context.logical_request_key)
+            if prior is not None:
+                validate_replay(prior, envelope)
+            return prior
+
+        def event_lineage(self, receipt: Any) -> tuple[Any, ...]:
+            wanted = set(receipt.event_ids)
+            return tuple(event for event in self.list_events() if event.event_id in wanted)
+
+
 @dataclass
 class RuntimeTaskOperationBinding:
     """One shared task request bound to Runtime's existing owner transaction.
 
-    Herzchen's qualified ``OperationManager`` owns a Herzchen ``Store`` and
-    cannot be pointed at Runtime's task schema.  This small owner-side seam
-    therefore carries only the common request identity and typed receipt
-    contract into Runtime's already-authoritative transaction.  It never
-    opens a second store or writes a second operation ledger.
+    The qualified Herzchen ``OperationManager`` is issued a finite Runtime
+    owner capability.  Its operation identity, event lineage, and receipt are
+    recorded through Runtime's existing command/event authority in the same
+    owner transaction as task admission.  It never opens a second store or
+    writer.
     """
 
     bridge: "RuntimeHerzchenBridge"
     request: Any
     target: Any
     _receipt_binding: RuntimeReceiptBinding | None = None
+    operation_record: Any | None = None
 
     @property
     def request_digest(self) -> str:
@@ -114,6 +465,17 @@ class RuntimeTaskOperationBinding:
             )
         return self._receipt_binding
 
+    def record_operation(self, transaction: Any) -> Any:
+        if self.operation_record is not None:
+            raise RuntimeOperationBindingError("Runtime shared operation was recorded twice")
+        self.operation_record = self.bridge.operation_manager.prepare(
+            self.request,
+            transaction=transaction,
+        )
+        if self.operation_record.receipt is None:
+            raise RuntimeOperationBindingError("Runtime shared operation did not return a durable receipt")
+        return self.operation_record
+
 
 class RuntimeHerzchenBridge:
     """Thin shared-contract ports over one admitted ``RuntimeService`` owner."""
@@ -134,6 +496,15 @@ class RuntimeHerzchenBridge:
         self.authority = authority or f"runtime-{realm_id}"
         self.actor_id = actor_id
         self.credential_ref = credential_ref
+        if HerzchenRuntimeOperationOwner is None or OperationManager is None:
+            raise HerzchenUnavailable("the installed Herzchen package lacks the Runtime owner capability")
+        self._operation_owner = _RuntimeOperationOwner(
+            runtime,
+            authority=self.authority,
+            actor=self.actor,
+        )
+        self._operation_owner_capability = issue_operation_owner(self._operation_owner)
+        self.operation_manager = OperationManager(self._operation_owner)
 
     @property
     def actor(self) -> Any:
@@ -215,13 +586,13 @@ class RuntimeHerzchenBridge:
             raise RuntimeOperationBindingError(
                 "shared task binding requires project and idempotency_key"
             )
-        target = self.project_ref(str(project_id))
+        target = self._ref("operation", str(idempotency_key))
         request = self.operation(
             "task.admit",
             logical_request_key=str(idempotency_key),
             target=target,
             payload=dict(body),
-            project_id=target.id,
+            project_id=str(project_id),
         )
         return RuntimeTaskOperationBinding(self, request, target)
 
@@ -307,11 +678,14 @@ class RuntimeHerzchenBridge:
     def admit_task(self, body: Mapping[str, Any], *, enforce_readiness: bool = False) -> Mapping[str, Any]:
         """Route the production task caller through the owner binding."""
         binding = self.task_operation(body)
-        return self.runtime._create_task_from_shared(
-            dict(body),
-            enforce_readiness=enforce_readiness,
-            shared_operation=binding,
-        )
+        with self._operation_owner.transaction() as transaction:
+            result = self.runtime._create_task_from_shared(
+                dict(body),
+                enforce_readiness=enforce_readiness,
+                shared_operation=binding,
+            )
+            binding.record_operation(transaction)
+            return result
 
     def claim_next(self, body: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
         return self.runtime.claim_next(dict(body), idempotency_key=idempotency_key)

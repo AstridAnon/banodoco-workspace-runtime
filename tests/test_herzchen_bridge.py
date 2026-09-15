@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from herzchen.adapters import HerzchenHostAdapter
-from herzchen.contracts import HostPort, ResourceRef
+from herzchen.contracts import AuthenticatedActor, HostPort, ResourceRef
+from herzchen.kernel.operations import OperationState
 from runtime_protocol.herzchen_bridge import RuntimeHerzchenBridge, RuntimeOperationBindingError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
@@ -233,3 +235,132 @@ def test_bridge_source_does_not_admit_a_parallel_store_or_raw_database() -> None
     assert "from herzchen.kernel import Store" not in text
     assert "sqlite3" not in text
     assert "runtime.store" not in text
+
+
+def test_runtime_operation_manager_uses_runtime_owner_transaction_and_replays_lineage() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary) / "realm"
+        RealmStore.initialize(root, realm_id="operation-realm").close()
+        runtime = RuntimeService(root, realm_id="operation-realm")
+        try:
+            project = runtime.create_project(
+                {"name": "Operation", "slug": "operation"},
+                idempotency_key="operation-project-1",
+            )
+            body = {
+                "capability_id": "operation.cpu",
+                "project": project["id"],
+                "idempotency_key": "operation-task-1",
+                "spec": {"inputs": {}},
+            }
+            first = runtime.create_task(body)
+            record = runtime.herzchen.operation_manager.get(body["idempotency_key"])
+            assert record is not None
+            assert record.state is OperationState.PREPARED
+            assert record.receipt is not None
+            assert record.receipt.event_ids
+            operation_events = runtime.herzchen._operation_owner_capability.list_events(stream="operations")
+            assert len(operation_events) == 1
+            assert operation_events[0].event_type == "operation.prepared"
+            assert operation_events[0].effects["state"] == "prepared"
+
+            with runtime.herzchen._operation_owner.transaction() as transaction:
+                committed = runtime.herzchen.operation_manager.record_outcome(
+                    record,
+                    OperationState.COMMITTED,
+                    {"task_id": first["task"]["id"]},
+                    transaction=transaction,
+                )
+            assert committed.state is OperationState.COMMITTED
+            replayed = runtime.herzchen.operation_manager.get(body["idempotency_key"])
+            assert replayed is not None
+            assert replayed.state is OperationState.COMMITTED
+            assert replayed.version == 2
+            assert replayed.result == {"task_id": first["task"]["id"]}
+            assert len(runtime.herzchen._operation_owner_capability.list_events(stream="operations")) == 2
+
+            second = runtime.create_task(body)
+            assert second["task"]["id"] == first["task"]["id"]
+            assert len(runtime.herzchen._operation_owner_capability.list_events(stream="operations")) == 2
+
+            runtime.close()
+            runtime = RuntimeService(root, realm_id="operation-realm")
+            reopened = runtime.herzchen.operation_manager.get(body["idempotency_key"])
+            assert reopened is not None
+            assert reopened.state is OperationState.COMMITTED
+            assert len(runtime.herzchen._operation_owner_capability.event_lineage(reopened.receipt)) == 1
+            assert len(runtime.herzchen._operation_owner_capability.list_events(stream="operations")) == 2
+        finally:
+            runtime.close()
+
+
+def test_runtime_operation_owner_rollback_and_finite_reader_boundary() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary) / "realm"
+        RealmStore.initialize(root, realm_id="operation-rollback-realm").close()
+        runtime = RuntimeService(root, realm_id="operation-rollback-realm")
+        try:
+            project = runtime.create_project(
+                {"name": "Rollback", "slug": "rollback"},
+                idempotency_key="rollback-project-1",
+            )
+            body = {
+                "capability_id": "rollback.cpu",
+                "project": project["id"],
+                "idempotency_key": "rollback-task-1",
+                "spec": {"inputs": {}},
+            }
+            runtime.create_task(body)
+            record = runtime.herzchen.operation_manager.get(body["idempotency_key"])
+            assert record is not None
+            try:
+                with runtime.herzchen._operation_owner.transaction() as transaction:
+                    runtime.herzchen.operation_manager.record_outcome(
+                        record,
+                        OperationState.COMMITTED,
+                        {"rolled_back": True},
+                        transaction=transaction,
+                    )
+                    raise RuntimeError("rollback operation outcome")
+            except RuntimeError as exc:
+                assert str(exc) == "rollback operation outcome"
+            after = runtime.herzchen.operation_manager.get(body["idempotency_key"])
+            assert after is not None and after.state is OperationState.PREPARED
+            assert len(runtime.herzchen._operation_owner_capability.list_events(stream="operations")) == 1
+
+            spoofed = replace(
+                after.request,
+                actor=AuthenticatedActor("foreign-runtime", "intruder", "foreign-credential"),
+            )
+            try:
+                with runtime.herzchen._operation_owner.transaction() as transaction:
+                    runtime.herzchen.operation_manager.prepare(spoofed, transaction=transaction)
+            except RuntimeOperationBindingError as exc:
+                assert "actor" in str(exc)
+            else:
+                raise AssertionError("Runtime accepted a spoofed operation actor")
+            assert len(runtime.herzchen._operation_owner_capability.list_events(stream="operations")) == 1
+
+            reader = runtime.herzchen._operation_owner_capability.reader
+            assert not hasattr(reader, "connection")
+            assert not hasattr(reader, "transaction")
+            assert not hasattr(reader, "mutate")
+            assert not hasattr(reader, "execute")
+            assert not hasattr(reader, "cursor")
+            assert reader.registered_domains() == runtime.herzchen._operation_owner.registered_domains()
+            assert reader.domain_descriptor_digest == runtime.herzchen._operation_owner.domain_descriptor_digest
+            assert runtime.herzchen._operation_owner_capability.reader is reader
+
+            try:
+                with runtime.herzchen._operation_owner.transaction() as transaction:
+                    runtime.herzchen.operation_manager.record_outcome(
+                        after,
+                        OperationState.COMMITTED,
+                        {"transaction": "owner"},
+                        transaction=transaction,
+                    )
+            except Exception as exc:  # pragma: no cover - diagnostic guard
+                raise AssertionError("owner transaction could not commit a valid outcome") from exc
+            assert runtime.herzchen.operation_manager.get(body["idempotency_key"]).state is OperationState.COMMITTED
+        finally:
+            runtime.close()
