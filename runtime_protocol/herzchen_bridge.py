@@ -19,6 +19,7 @@ import hashlib
 import json
 from typing import Any, Mapping, Optional
 
+from .errors import ConflictError
 from .util import new_id, now
 
 
@@ -27,8 +28,8 @@ class HerzchenUnavailable(RuntimeError):
 
 
 try:  # Keep the Runtime importable in its normal standalone distribution.
-    from herzchen.content import ContentCommandHandler
-    from herzchen.extensions import ExtensionCommandService
+    from herzchen.content import ContentCommandHandler, domain_contribution as content_domain_contribution
+    from herzchen.extensions import ExtensionCommandService, domain_contribution as extension_domain_contribution
     from herzchen.adapters import HerzchenHostAdapter
     from herzchen.contracts import (
         AuthenticatedActor,
@@ -53,9 +54,16 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
         StoreAdmissionError,
         issue_operation_owner,
     )
+    try:
+        from herzchen.kernel.store import (
+            RuntimeDomainOwner as HerzchenRuntimeDomainOwner,
+            DomainOwnerCapability as HerzchenDomainOwnerCapability,
+        )
+    except ImportError:  # Older pinned packages retain the operation seam only.
+        HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR: Optional[BaseException] = None
-except ModuleNotFoundError as exc:  # pragma: no cover - exercised by standalone installs
-    ContentCommandHandler = ExtensionCommandService = None  # type: ignore[assignment]
+except ImportError as exc:  # pragma: no cover - exercised by standalone installs
+    ContentCommandHandler = ExtensionCommandService = content_domain_contribution = extension_domain_contribution = None  # type: ignore[assignment]
     HerzchenHostAdapter = None  # type: ignore[assignment]
     AuthenticatedActor = CommandReceipt = DomainContribution = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
     canonical_json = validate_replay = None  # type: ignore[assignment]
@@ -64,7 +72,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by standalone
     OperationRequest = None  # type: ignore[assignment]
     request_digest = None  # type: ignore[assignment]
     IdentityRecord = None  # type: ignore[assignment]
-    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = StoreAdmissionError = issue_operation_owner = None  # type: ignore[assignment]
+    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = StoreAdmissionError = issue_operation_owner = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR = exc
 
 
@@ -451,6 +459,16 @@ class _RuntimeGenericReader(HerzchenRuntimeOperationReader if HerzchenRuntimeOpe
     def get_identity(self, ref: Any) -> Any:
         return self._writer.get_identity(ref)
 
+    @property
+    def domain_descriptor_digest(self) -> str:
+        return self._writer.domain_descriptor_digest
+
+    def registered_domains(self) -> tuple[Any, ...]:
+        return self._writer.registered_domains()
+
+    def get_receipt(self, logical_request_key: str) -> Any:
+        return self._writer.get_receipt(logical_request_key)
+
     def get_reference(self, ref: Any) -> Any:
         return self._writer.get_reference(ref)
 
@@ -458,7 +476,7 @@ class _RuntimeGenericReader(HerzchenRuntimeOperationReader if HerzchenRuntimeOpe
         return ()
 
 
-class _RuntimeGenericWriter:
+class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainOwner is not None else object):
     """DAT writer seam backed by the already-open Runtime RealmStore.
 
     This adapter deliberately contains no connection of its own.  Generic
@@ -536,7 +554,7 @@ class _RuntimeGenericWriter:
                 version = int(value["version"])
                 payload = {"record_type": "runtime.shot", "metadata": dict(value.get("metadata") or {}), "value": value}
             elif ref.kind == "runtime.task":
-                value = self.runtime.get_task(ref.id)
+                value = getattr(self.runtime, "store").get_task(ref.id)
                 task = value.get("task", value) if isinstance(value, Mapping) else value
                 version = int(task.get("version", 1)) if isinstance(task, Mapping) else 1
                 payload = {"record_type": "runtime.task", "metadata": {}, "value": value}
@@ -544,6 +562,17 @@ class _RuntimeGenericWriter:
                 return None
         except Exception:
             return None
+        if ref.kind == "runtime.task":
+            # Task metadata extensions are Runtime-generic identities.  The
+            # task admission record remains Runtime-owned; when an extension
+            # head exists, project its preserved payload as the fresh shared
+            # read without replacing the task's core authority.
+            extension_row = self._head_row(ResourceRef(self.authority, ref.kind, ref.id))
+            if extension_row is not None:
+                extension_payload = json.loads(extension_row["payload_json"])
+                if extension_payload.get("record_type") == "runtime.task":
+                    payload = extension_payload
+                    version = int(extension_row["version"])
         current_ref = ResourceRef(self.authority, ref.kind, ref.id, f"runtime-v{version}")
         if ref.revision is not None and ref.revision != current_ref.revision:
             return None
@@ -569,6 +598,13 @@ class _RuntimeGenericWriter:
 
     def consumer(self) -> _RuntimeGenericReader:
         return self.reader
+
+    def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
+        return ()
+
+    @property
+    def domain_descriptor_digest(self) -> str:
+        return _runtime_descriptor_digest(self.registered_domains())
 
     def registered_domains(self) -> tuple[Any, ...]:
         return tuple(
@@ -736,7 +772,10 @@ class _RuntimeGenericWriter:
             document = payload["document"]
             revision = payload["revision"]
             current = self.runtime.get_document(project_id, document.ref.id)
-            result = self.runtime.update_document(project_id, document.ref.id, {"expected_version": int(current["version"]), "content": revision.content, "kind": document.role}, idempotency_key=key)
+            expected_version = envelope.context.expected_version
+            if expected_version is None:
+                expected_version = int(current["version"])
+            result = self.runtime.update_document(project_id, document.ref.id, {"expected_version": int(expected_version), "content": revision.content, "kind": document.role}, idempotency_key=key)
             return result.get("data", result) if isinstance(result, Mapping) else result, self._runtime_receipt(result, kind="document.update", aggregate_id=document.ref.id, key=key, project_id=project_id), project_id
         if operation.startswith("dat.extensions.metadata."):
             subject = envelope.target
@@ -759,15 +798,45 @@ class _RuntimeGenericWriter:
             if prior.request_digest != envelope.context.request_digest:
                 raise RuntimeOperationBindingError("generic logical request key was reused with changed input")
             return replace(prior, replayed=True)
+        current_identity = self.get_identity(envelope.target)
+        expected_version = envelope.context.expected_version
+        if current_identity is not None and expected_version is not None and current_identity.version != expected_version:
+            raise ConflictError(
+                "shared identity version conflict",
+                details={"expected": expected_version, "actual": current_identity.version},
+            )
+        expected_revision = envelope.context.expected_revision
+        if current_identity is not None and expected_revision is not None:
+            actual_revision = current_identity.ref.revision
+            if envelope.target.kind == "runtime.document":
+                current_revision = current_identity.payload.get("current_revision")
+                if isinstance(current_revision, Mapping):
+                    actual_revision = current_revision.get("revision")
+            if actual_revision != expected_revision:
+                raise ConflictError(
+                    "shared identity revision conflict",
+                    details={"expected": expected_revision, "actual": actual_revision},
+                )
         result, runtime_receipt, project_id = self._delegate_core(envelope)
         final_ref = result_ref or envelope.target
         if identity_payload is not None and isinstance(final_ref, ResourceRef) and final_ref.revision is not None:
             version = int(envelope.context.expected_version or 0) + 1
-            self._put_head(envelope.target, identity_payload, version=max(1, version))
+            head_ref = final_ref if envelope.operation.startswith("dat.extensions.metadata.") else envelope.target
+            self._put_head(head_ref, identity_payload, version=max(1, version))
         if envelope.operation in {"dat.content.link", "dat.content.unlink"}:
             association = envelope.payload.get("association")
             if association is not None:
-                self._put_row(envelope.target, {"record_type": "dat.content.association", "association": _contract_json(association), "active": envelope.operation.endswith("link")}, version=1)
+                current_association = self.get_identity(envelope.target)
+                association_version = 1 if current_association is None else current_association.version + 1
+                self._put_head(
+                    envelope.target,
+                    {
+                        "record_type": "dat.content.association",
+                        "association": _contract_json(association),
+                        "active": envelope.operation == "dat.content.link",
+                    },
+                    version=association_version,
+                )
                 self.store.conn.execute("INSERT OR IGNORE INTO herzchen_references(authority, kind, id, revision, created_at) VALUES (?, ?, ?, ?, ?)", (envelope.target.authority, envelope.target.kind, envelope.target.id, "", now()))
         return self._store_generic_receipt(envelope, result, runtime_receipt=runtime_receipt, project_id=project_id, result_ref=final_ref)
 
@@ -865,18 +934,35 @@ class RuntimeHerzchenBridge:
         self.extensions = None
         self.generic_contract_error = None
         try:
-            self.content = ContentCommandHandler(self._generic_writer)
-            self.extensions = ExtensionCommandService(self._generic_writer)
-        except StoreAdmissionError as exc:
-            # Keep the already-proven operation bridge usable while the
-            # installed shared command facade lacks the foreign Runtime
-            # domain-owner capability.  Do not counterfeit DAT support or
-            # widen the local adapter into a second Store.
-            self.generic_contract_error = HerzchenUnavailable(
-                "the installed Herzchen command facade cannot issue DAT ports over the Runtime owner"
+            if (
+                HerzchenRuntimeDomainOwner is None
+                or HerzchenDomainOwnerCapability is None
+                or content_domain_contribution is None
+                or extension_domain_contribution is None
+            ):
+                raise HerzchenUnavailable(
+                    "the installed Herzchen package lacks the scoped Runtime domain-owner capability"
+                )
+            # Domain descriptors are part of the same Runtime-owned durable
+            # admission set before either public DAT façade is composed.
+            self._generic_writer.register_domain(content_domain_contribution())
+            self._generic_writer.register_domain(extension_domain_contribution())
+            content_owner = HerzchenDomainOwnerCapability.issue_runtime(
+                self._generic_writer, "dat.content"
             )
-            self.content = None
-            self.extensions = None
+            extension_owner = HerzchenDomainOwnerCapability.issue_runtime(
+                self._generic_writer, "dat.extensions"
+            )
+            self.content = ContentCommandHandler(content_owner)
+            self.extensions = ExtensionCommandService(extension_owner)
+        except (StoreAdmissionError, HerzchenUnavailable) as exc:
+            # Keep the already-proven operation bridge usable while an older
+            # shared installation lacks the scoped Runtime domain capability.
+            # Do not counterfeit DAT support or widen the local adapter into a
+            # second Store.
+            self.generic_contract_error = exc if isinstance(exc, HerzchenUnavailable) else HerzchenUnavailable(
+                "the installed Herzchen command facade rejected the scoped Runtime DAT capability"
+            )
 
     @property
     def actor(self) -> Any:
