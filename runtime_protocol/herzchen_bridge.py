@@ -45,6 +45,11 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
         )
     except ImportError:  # Older pinned packages may not contain pack authoring.
         ManagedPackAuthoringHandler = pack_authoring_domain_contribution = None  # type: ignore[assignment]
+    try:
+        from herzchen.packs.templates import TemplateEngine
+        from herzchen.domains.work import contributions as work_domain_contributions
+    except ImportError:  # Older pinned packages may not contain work templates.
+        TemplateEngine = work_domain_contributions = None  # type: ignore[assignment]
     from herzchen.adapters import HerzchenHostAdapter
     from herzchen.contracts import (
         AuthenticatedActor,
@@ -73,14 +78,15 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
         from herzchen.kernel.store import (
             RuntimeDomainOwner as HerzchenRuntimeDomainOwner,
             DomainOwnerCapability as HerzchenDomainOwnerCapability,
+            DomainHandler as HerzchenDomainHandler,
         )
     except ImportError:  # Older pinned packages retain the operation seam only.
-        HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = None  # type: ignore[assignment]
+        HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = HerzchenDomainHandler = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as exc:  # pragma: no cover - exercised by standalone installs
     ContentCommandHandler = ExtensionCommandService = content_domain_contribution = extension_domain_contribution = None  # type: ignore[assignment]
     AuthoringSessionService = authoring_domain_contribution = AuthoringLifecycle = None  # type: ignore[assignment]
-    ManagedPackAuthoringHandler = pack_authoring_domain_contribution = None  # type: ignore[assignment]
+    ManagedPackAuthoringHandler = pack_authoring_domain_contribution = TemplateEngine = work_domain_contributions = None  # type: ignore[assignment]
     HerzchenHostAdapter = None  # type: ignore[assignment]
     AuthenticatedActor = CommandReceipt = DomainContribution = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
     canonical_json = validate_replay = None  # type: ignore[assignment]
@@ -89,7 +95,7 @@ except ImportError as exc:  # pragma: no cover - exercised by standalone install
     OperationRequest = None  # type: ignore[assignment]
     request_digest = None  # type: ignore[assignment]
     IdentityRecord = None  # type: ignore[assignment]
-    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = StoreAdmissionError = issue_operation_owner = None  # type: ignore[assignment]
+    HerzchenRuntimeOperationOwner = HerzchenRuntimeOperationReader = HerzchenRuntimeDomainOwner = HerzchenDomainOwnerCapability = HerzchenDomainHandler = StoreAdmissionError = issue_operation_owner = None  # type: ignore[assignment]
     _HERZCHEN_IMPORT_ERROR = exc
 
 
@@ -98,6 +104,15 @@ def _require_herzchen() -> None:
         raise HerzchenUnavailable(
             "the pinned Herzchen contract package is required for the shared Runtime binding"
         ) from _HERZCHEN_IMPORT_ERROR
+
+
+def _runtime_idempotency_key(value: str) -> str:
+    """Map shared request keys to Runtime's stricter wire grammar."""
+    if value and value[0].isalnum() and all(
+        character.isalnum() or character in "._~-" for character in value
+    ) and len(value) <= 256:
+        return value
+    return "herzchen-" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -125,6 +140,22 @@ def _runtime_descriptor_digest(descriptors: tuple[Any, ...]) -> str:
     """Match FND's canonical descriptor digest without importing its internals."""
     ordered = sorted(descriptors, key=lambda descriptor: descriptor.domain_id)
     return hashlib.sha256(canonical_json([descriptor.to_dict() for descriptor in ordered]).encode("utf-8")).hexdigest()
+
+
+def _template_domain_contribution() -> Any:
+    """Describe the public template orchestration port over Runtime."""
+    return DomainContribution(
+        "herzchen.packs.templates",
+        "1",
+        "pkg",
+        (),
+        (),
+        ("pack.templates",),
+        ("work.template.instantiate",),
+        ("work.template.instantiated",),
+        "pkg-03.template.v1",
+        ("fnd-03.transaction", "handler-required"),
+    )
 
 
 if HerzchenRuntimeOperationOwner is not None:
@@ -590,6 +621,43 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
                 value = self.runtime.get_project(ref.id)
                 version = int(value["version"])
                 payload = {"record_type": "runtime.project", "metadata": dict(value.get("metadata") or {}), "value": value}
+            elif ref.kind == "work.project":
+                # The shared work graph addresses an existing Runtime project
+                # through this explicit, read-only projection. The business
+                # identity stays runtime.project; child work records retain
+                # this work ref plus their Runtime project id in provenance.
+                value = self.runtime.get_project(ref.id)
+                version = int(value["version"])
+                runtime_ref = ResourceRef(
+                    self.authority,
+                    "runtime.project",
+                    str(value["id"]),
+                    f"runtime-v{version}",
+                )
+                metadata = dict(value.get("metadata") or {})
+                payload = {
+                    "kind": "project",
+                    "id": str(value["id"]),
+                    "title": str(value.get("name") or value["id"]),
+                    "name": str(value.get("name") or value["id"]),
+                    "aliases": [str(value.get("slug") or value["id"])],
+                    "parent": None,
+                    "dependencies": [],
+                    "project_ref": None,
+                    "lifecycle": "pending",
+                    "readiness": {"status": "not-evaluated", "ready": False, "dispatch": False},
+                    "outcome": str(metadata.get("outcome") or ""),
+                    "scope": str(metadata.get("scope") or ""),
+                    "approach": str(metadata.get("approach") or ""),
+                    "acceptance": dict(metadata.get("acceptance") or {}),
+                    "tasks": [],
+                    "documents": [],
+                    "metadata": metadata,
+                    "fields": {
+                        "runtime_project_ref": runtime_ref.to_dict(),
+                        "runtime_project_version": version,
+                    },
+                }
             elif ref.kind == "runtime.shot":
                 value = self.runtime.get_project_shot_by_id(ref.id) if hasattr(self.runtime, "get_project_shot_by_id") else None
                 if value is None:
@@ -619,7 +687,8 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
                 if extension_payload.get("record_type") == "runtime.task":
                     payload = extension_payload
                     version = int(extension_row["version"])
-        current_ref = ResourceRef(self.authority, ref.kind, ref.id, f"runtime-v{version}")
+        revision_prefix = "rev-" if ref.kind == "work.project" else "runtime-v"
+        current_ref = ResourceRef(self.authority, ref.kind, ref.id, f"{revision_prefix}{version}")
         if ref.revision is not None and ref.revision != current_ref.revision:
             return None
         return IdentityRecord(current_ref, version, payload, None, str(value.get("created_at", "")) if isinstance(value, Mapping) else "", str(value.get("updated_at", "")) if isinstance(value, Mapping) else "")
@@ -641,6 +710,10 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             (ref.authority, ref.kind, ref.id, self._revision_key(ref)),
         ).fetchone()
         return ref if row is not None else None
+
+    def get_record(self, ref: Any) -> Any:
+        """Expose the finite record alias expected by the shared work graph."""
+        return self.get_identity(ref)
 
     def consumer(self) -> _RuntimeGenericReader:
         return self.reader
@@ -816,7 +889,7 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
     def _delegate_core(self, envelope: Any) -> tuple[Any, Mapping[str, Any] | None, str | None]:
         payload = envelope.payload
         project_id = self._project_id_for_ref(envelope.target, payload)
-        key = str(envelope.context.logical_request_key)
+        key = _runtime_idempotency_key(str(envelope.context.logical_request_key))
         operation = str(envelope.operation)
         if operation == "dat.content.document.create":
             document = payload["document"]
@@ -990,6 +1063,19 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
                 final_ref.id,
                 f"runtime-v{next_version}",
             )
+        if (
+            identity_payload is not None
+            and isinstance(final_ref, ResourceRef)
+            and final_ref.revision is None
+            and final_ref.kind.startswith("work.")
+        ):
+            next_version = current_identity.version + 1 if current_identity is not None else 1
+            final_ref = ResourceRef(
+                final_ref.authority,
+                final_ref.kind,
+                final_ref.id,
+                f"rev-{next_version}",
+            )
         if identity_payload is not None and isinstance(final_ref, ResourceRef) and final_ref.revision is not None:
             version = current_identity.version + 1 if current_identity is not None else max(1, int(envelope.context.expected_version or 0) + 1)
             # The shared owner supplies the new head reference.  Keeping that
@@ -997,6 +1083,16 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             # pinned read address the exact authored snapshot.
             head_ref = final_ref
             self._put_head(head_ref, identity_payload, version=max(1, version))
+        elif (
+            envelope.operation == "work.create"
+            and isinstance(envelope.payload, Mapping)
+            and isinstance(final_ref, ResourceRef)
+            and final_ref.revision is not None
+        ):
+            # WorkGraph supplies the canonical rev-1 result ref for creates;
+            # persist the exact public payload under that head so later
+            # TemplateEngine reads observe the same shared graph.
+            self._put_head(final_ref, envelope.payload, version=1)
         if envelope.operation in {"dat.content.link", "dat.content.unlink"}:
             association = envelope.payload.get("association")
             if association is not None:
@@ -1035,6 +1131,95 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             generic_event_ids=() if event_id is None else (event_id,),
             transaction_id=transaction_id,
         )
+
+
+class _RuntimeTemplateDomainHandler(HerzchenDomainHandler if HerzchenDomainHandler is not None else object):
+    """Trusted multi-domain composition wrapper for the public template engine.
+
+    ``TemplateEngine`` is an orchestration facade: its public instantiate
+    command delegates work-graph and DAT commands to nested public facades in
+    one transaction.  A single scoped ``DomainOwnerCapability`` cannot issue
+    those different nested ports, so this owner-local handler exposes only the
+    already-admitted Runtime domains and reuses the same generic writer.  It is
+    never serialized or handed to an ordinary consumer.
+    """
+
+    __slots__ = ("_writer",)
+
+    def __init__(self, writer: Any) -> None:
+        if writer is None or HerzchenDomainOwnerCapability is None:
+            raise HerzchenUnavailable("the installed Herzchen package lacks template owner composition")
+        self._writer = writer
+
+    @property
+    def authority(self) -> str:
+        return self._writer.authority
+
+    @property
+    def connection(self) -> Any:
+        return self._writer.store.conn
+
+    @property
+    def domain_ids(self) -> tuple[str, ...]:
+        return tuple(item.domain_id for item in self._writer.registered_domains())
+
+    def transaction(self) -> Any:
+        return self._writer.transaction()
+
+    def mutate(self, envelope: Any, **kwargs: Any) -> Any:
+        return self._writer.mutate(envelope, **kwargs)
+
+    def put_identity(self, *args: Any, **kwargs: Any) -> Any:
+        return self._writer.put_identity(*args, **kwargs)
+
+    def revise_identity(self, *args: Any, **kwargs: Any) -> Any:
+        return self._writer.revise_identity(*args, **kwargs)
+
+    def put_reference(self, *args: Any, **kwargs: Any) -> Any:
+        return self._writer.put_reference(*args, **kwargs)
+
+    def get_identity(self, ref: Any) -> Any:
+        return self._writer.get_identity(ref)
+
+    def get_record(self, ref: Any) -> Any:
+        return self._writer.get_record(ref)
+
+    def get_reference(self, ref: Any) -> Any:
+        return self._writer.get_reference(ref)
+
+    def get_receipt(self, logical_request_key: str) -> Any:
+        return self._writer.get_receipt(logical_request_key)
+
+    def registered_domains(self) -> tuple[Any, ...]:
+        return self._writer.registered_domains()
+
+    def consumer(self) -> Any:
+        return self._writer.consumer()
+
+    def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
+        return self._writer.list_events(stream=stream)
+
+    def register_domain(self, contribution: Any, **kwargs: Any) -> Any:
+        return self._writer.register_domain(contribution, **kwargs)
+
+    def domain_handler(self, contributions: Any) -> "_RuntimeTemplateDomainHandler":
+        expected = {item.domain_id for item in contributions}
+        if not expected.issubset(set(self.domain_ids)):
+            raise StoreAdmissionError("template composition requested an unadmitted Runtime domain")
+        return self
+
+    def issue_command_port(
+        self,
+        engine: Any,
+        domain_id: str,
+        endpoints: Any,
+        *,
+        reader: Any = None,
+    ) -> Any:
+        if HerzchenDomainOwnerCapability is None:
+            raise HerzchenUnavailable("the installed Herzchen package lacks scoped Runtime capabilities")
+        capability = HerzchenDomainOwnerCapability.issue_runtime(self._writer, domain_id)
+        return capability.issue_command_port(engine, domain_id, endpoints, reader=reader)
 
 
 @dataclass
@@ -1130,24 +1315,31 @@ class RuntimeHerzchenBridge:
         self.extensions = None
         self.managed_packs = None
         self.authoring = None
+        self.template_engine = None
         self.generic_contract_error = None
         try:
             if (
                 HerzchenRuntimeDomainOwner is None
                 or HerzchenDomainOwnerCapability is None
+                or HerzchenDomainHandler is None
                 or content_domain_contribution is None
                 or extension_domain_contribution is None
                 or ManagedPackAuthoringHandler is None
                 or pack_authoring_domain_contribution is None
+                or TemplateEngine is None
+                or work_domain_contributions is None
             ):
                 raise HerzchenUnavailable(
                     "the installed Herzchen package lacks the scoped Runtime domain-owner capability"
                 )
             # Domain descriptors are part of the same Runtime-owned durable
             # admission set before either public DAT façade is composed.
+            for contribution in work_domain_contributions():
+                self._generic_writer.register_domain(contribution)
             self._generic_writer.register_domain(content_domain_contribution())
             self._generic_writer.register_domain(extension_domain_contribution())
             self._generic_writer.register_domain(pack_authoring_domain_contribution())
+            self._generic_writer.register_domain(_template_domain_contribution())
             content_owner = HerzchenDomainOwnerCapability.issue_runtime(
                 self._generic_writer, "dat.content"
             )
@@ -1170,6 +1362,10 @@ class RuntimeHerzchenBridge:
                     self._generic_writer, "herzchen.authoring.sessions"
                 )
                 self.authoring = AuthoringSessionService(authoring_owner)
+            self.template_engine = TemplateEngine(
+                _RuntimeTemplateDomainHandler(self._generic_writer),
+                actor=self.actor,
+            )
         except (StoreAdmissionError, HerzchenUnavailable) as exc:
             # Keep the already-proven operation bridge usable while an older
             # shared installation lacks the scoped Runtime domain capability.

@@ -175,6 +175,25 @@ CREATE TABLE herzchen_identity_heads (
     FOREIGN KEY(authority, kind, id, revision)
       REFERENCES herzchen_identities(authority, kind, id, revision)
 );
+-- FND's public WorkGraph reads this stable current-head projection. Runtime
+-- remains the sole writer: the view exposes only the current generic head and
+-- never creates a second identity table or authority.
+CREATE VIEW identities AS
+SELECT i.authority,
+       i.kind,
+       i.id,
+       i.revision AS current_revision,
+       i.version,
+       i.payload_json,
+       i.edit_token,
+       i.created_at,
+       i.updated_at
+  FROM herzchen_identities AS i
+  JOIN herzchen_identity_heads AS h
+    ON h.authority = i.authority
+   AND h.kind = i.kind
+   AND h.id = i.id
+   AND h.revision = i.revision;
 CREATE TABLE herzchen_references (
     authority TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
     revision TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
