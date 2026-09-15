@@ -180,6 +180,20 @@ CREATE TABLE herzchen_references (
     revision TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
     PRIMARY KEY(authority, kind, id, revision)
 );
+CREATE TABLE herzchen_events (
+    event_id TEXT PRIMARY KEY, store_authority TEXT NOT NULL,
+    stream TEXT NOT NULL, subject_authority TEXT NOT NULL,
+    subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL,
+    subject_revision TEXT, schema_revision TEXT NOT NULL,
+    event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
+    actor_authority TEXT NOT NULL, actor_id TEXT NOT NULL,
+    credential_ref TEXT NOT NULL, operation TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    correlation_id TEXT, causation_id TEXT, recorded_at TEXT NOT NULL,
+    occurred_at TEXT, before_refs_json TEXT NOT NULL,
+    after_refs_json TEXT NOT NULL, effects_json TEXT NOT NULL,
+    UNIQUE(store_authority, stream, sequence)
+);
 CREATE TABLE project_shots (
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL CHECK (length(trim(name)) > 0),

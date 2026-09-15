@@ -30,6 +30,21 @@ class HerzchenUnavailable(RuntimeError):
 try:  # Keep the Runtime importable in its normal standalone distribution.
     from herzchen.content import ContentCommandHandler, domain_contribution as content_domain_contribution
     from herzchen.extensions import ExtensionCommandService, domain_contribution as extension_domain_contribution
+    try:
+        from herzchen.authoring.sessions import (
+            AuthoringSessionService,
+            domain_contribution as authoring_domain_contribution,
+        )
+        from herzchen.authoring.integration import AuthoringLifecycle
+    except ImportError:  # Older pinned packages may not contain the EDT seam.
+        AuthoringSessionService = authoring_domain_contribution = AuthoringLifecycle = None  # type: ignore[assignment]
+    try:
+        from herzchen.packs.authoring import (
+            ManagedPackAuthoringHandler,
+            domain_contribution as pack_authoring_domain_contribution,
+        )
+    except ImportError:  # Older pinned packages may not contain pack authoring.
+        ManagedPackAuthoringHandler = pack_authoring_domain_contribution = None  # type: ignore[assignment]
     from herzchen.adapters import HerzchenHostAdapter
     from herzchen.contracts import (
         AuthenticatedActor,
@@ -64,6 +79,8 @@ try:  # Keep the Runtime importable in its normal standalone distribution.
     _HERZCHEN_IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as exc:  # pragma: no cover - exercised by standalone installs
     ContentCommandHandler = ExtensionCommandService = content_domain_contribution = extension_domain_contribution = None  # type: ignore[assignment]
+    AuthoringSessionService = authoring_domain_contribution = AuthoringLifecycle = None  # type: ignore[assignment]
+    ManagedPackAuthoringHandler = pack_authoring_domain_contribution = None  # type: ignore[assignment]
     HerzchenHostAdapter = None  # type: ignore[assignment]
     AuthenticatedActor = CommandReceipt = DomainContribution = EventEnvelope = ReceiptStatus = ResourceRef = None  # type: ignore[assignment]
     canonical_json = validate_replay = None  # type: ignore[assignment]
@@ -473,7 +490,7 @@ class _RuntimeGenericReader(HerzchenRuntimeOperationReader if HerzchenRuntimeOpe
         return self._writer.get_reference(ref)
 
     def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
-        return ()
+        return self._writer.list_events(stream=stream)
 
 
 class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainOwner is not None else object):
@@ -534,6 +551,35 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             row["edit_token"],
             str(row["created_at"]),
             str(row["updated_at"]),
+        )
+
+    def _event_from_row(self, row: Any) -> Any:
+        return EventEnvelope(
+            str(row["event_id"]),
+            str(row["store_authority"]),
+            str(row["stream"]),
+            ResourceRef(
+                str(row["subject_authority"]),
+                str(row["subject_kind"]),
+                str(row["subject_id"]),
+                row["subject_revision"],
+            ),
+            str(row["schema_revision"]),
+            str(row["event_type"]),
+            int(row["sequence"]),
+            AuthenticatedActor(
+                str(row["actor_authority"]),
+                str(row["actor_id"]),
+                str(row["credential_ref"]),
+            ),
+            str(row["operation"]),
+            row["correlation_id"],
+            row["causation_id"],
+            str(row["recorded_at"]),
+            row["occurred_at"],
+            tuple(ResourceRef.from_dict(value) for value in json.loads(row["before_refs_json"])),
+            tuple(ResourceRef.from_dict(value) for value in json.loads(row["after_refs_json"])),
+            json.loads(row["effects_json"]),
         )
 
     def _core_identity(self, ref: Any) -> Any:
@@ -600,7 +646,17 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
         return self.reader
 
     def list_events(self, *, stream: str | None = None) -> tuple[Any, ...]:
-        return ()
+        if stream is None:
+            rows = self.store.conn.execute(
+                "SELECT * FROM herzchen_events WHERE store_authority=? ORDER BY recorded_at, event_id",
+                (self.authority,),
+            ).fetchall()
+        else:
+            rows = self.store.conn.execute(
+                "SELECT * FROM herzchen_events WHERE store_authority=? AND stream=? ORDER BY sequence",
+                (self.authority, stream),
+            ).fetchall()
+        return tuple(self._event_from_row(row) for row in rows)
 
     @property
     def domain_descriptor_digest(self) -> str:
@@ -655,12 +711,12 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             return self.runtime.committed_receipt(kind, aggregate_id, key, project_id=project_id)
         return None
 
-    def _store_generic_receipt(self, envelope: Any, result: Any, *, runtime_receipt: Mapping[str, Any] | None, project_id: str | None, result_ref: Any, replayed: bool = False) -> Any:
+    def _store_generic_receipt(self, envelope: Any, result: Any, *, runtime_receipt: Mapping[str, Any] | None, project_id: str | None, result_ref: Any, generic_event_ids: tuple[str, ...] = (), transaction_id: str | None = None, replayed: bool = False) -> Any:
         command_kind = "herzchen." + str(envelope.operation)
         aggregate_id = str(envelope.target.id)
         key = str(envelope.context.logical_request_key)
-        event_ids = tuple(str(item) for item in (runtime_receipt or {}).get("event_ids", ()))
-        transaction_id = str((runtime_receipt or {}).get("receipt_id") or ("txn-" + new_id()))
+        event_ids = tuple(str(item) for item in (runtime_receipt or {}).get("event_ids", ())) + tuple(generic_event_ids)
+        transaction_id = transaction_id or str((runtime_receipt or {}).get("receipt_id") or ("txn-" + new_id()))
         stored_result = {
             "target": envelope.target,
             "result_ref": result_ref,
@@ -791,7 +847,105 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
             return next_payload, None, project_id
         return payload, None, project_id
 
-    def mutate(self, envelope: Any, *, result_ref: Any = None, before_refs: tuple[Any, ...] = (), after_refs: tuple[Any, ...] = (), effects: Mapping[str, Any] | None = None, transaction: Any = None, identity_payload: Mapping[str, Any] | None = None, **_: Any) -> Any:
+    def _append_herzchen_event(
+        self,
+        envelope: Any,
+        *,
+        event_type: str,
+        result_ref: Any,
+        before_refs: tuple[Any, ...],
+        after_refs: tuple[Any, ...],
+        effects: Mapping[str, Any] | None,
+        stream: str | None,
+        event_schema_revision: str,
+        occurred_at: str | None,
+        current_identity: Any,
+        transaction_id: str,
+    ) -> str:
+        event_stream = str(stream or f"{envelope.target.kind}:{envelope.target.id}")
+        next_sequence = int(
+            self.store.conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM herzchen_events "
+                "WHERE store_authority=? AND stream=?",
+                (self.authority, event_stream),
+            ).fetchone()[0]
+        )
+        event_id = "herzchen-event-" + new_id()
+        subject = result_ref or envelope.target
+        before = tuple(before_refs)
+        if not before and current_identity is not None:
+            before = (current_identity.ref,)
+        after = tuple(after_refs)
+        if not after and result_ref is not None:
+            after = (result_ref,)
+        actor = envelope.context.actor
+        recorded_at = now()
+        self.store.conn.execute(
+            "INSERT INTO herzchen_events(" \
+            "event_id, store_authority, stream, subject_authority, subject_kind, subject_id, subject_revision, " \
+            "schema_revision, event_type, sequence, actor_authority, actor_id, credential_ref, operation, " \
+            "transaction_id, correlation_id, causation_id, recorded_at, occurred_at, before_refs_json, after_refs_json, effects_json) " \
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                self.authority,
+                event_stream,
+                subject.authority,
+                subject.kind,
+                subject.id,
+                subject.revision,
+                event_schema_revision,
+                event_type,
+                next_sequence,
+                actor.authority,
+                actor.actor,
+                actor.credential_ref,
+                envelope.operation,
+                transaction_id,
+                envelope.context.correlation_id,
+                envelope.context.causation_id,
+                recorded_at,
+                occurred_at,
+                canonical_json([ref.to_dict() for ref in before]),
+                canonical_json([ref.to_dict() for ref in after]),
+                canonical_json(_contract_json(effects or {})),
+            ),
+        )
+        return event_id
+
+    def mutate(
+        self,
+        envelope: Any,
+        *,
+        event_type: str | None = None,
+        result_ref: Any = None,
+        before_refs: tuple[Any, ...] = (),
+        after_refs: tuple[Any, ...] = (),
+        effects: Mapping[str, Any] | None = None,
+        stream: str | None = None,
+        event_schema_revision: str = "fnd-03.event.v1",
+        occurred_at: str | None = None,
+        no_op: bool = False,
+        transaction: Any = None,
+        identity_payload: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> Any:
+        if transaction is None:
+            with self.transaction() as active:
+                return self.mutate(
+                    envelope,
+                    event_type=event_type,
+                    result_ref=result_ref,
+                    before_refs=before_refs,
+                    after_refs=after_refs,
+                    effects=effects,
+                    stream=stream,
+                    event_schema_revision=event_schema_revision,
+                    occurred_at=occurred_at,
+                    no_op=no_op,
+                    transaction=active,
+                    identity_payload=identity_payload,
+                )
         self._require_transaction(transaction)
         prior = self.get_receipt(envelope.context.logical_request_key)
         if prior is not None:
@@ -819,9 +973,29 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
                 )
         result, runtime_receipt, project_id = self._delegate_core(envelope)
         final_ref = result_ref or envelope.target
+        if (
+            identity_payload is not None
+            and isinstance(final_ref, ResourceRef)
+            and final_ref.revision is None
+            and final_ref.kind in {"authoring-scope", "authoring-actor"}
+        ):
+            # EDT deliberately addresses its active scope/actor heads without
+            # a caller-supplied revision.  Give those heads the same durable
+            # revisioned identity treatment as managed packs while keeping
+            # Runtime core identities out of the generic table.
+            next_version = current_identity.version + 1 if current_identity is not None else 1
+            final_ref = ResourceRef(
+                final_ref.authority,
+                final_ref.kind,
+                final_ref.id,
+                f"runtime-v{next_version}",
+            )
         if identity_payload is not None and isinstance(final_ref, ResourceRef) and final_ref.revision is not None:
-            version = int(envelope.context.expected_version or 0) + 1
-            head_ref = final_ref if envelope.operation.startswith("dat.extensions.metadata.") else envelope.target
+            version = current_identity.version + 1 if current_identity is not None else max(1, int(envelope.context.expected_version or 0) + 1)
+            # The shared owner supplies the new head reference.  Keeping that
+            # revision on the Runtime generic identity is what makes a later
+            # pinned read address the exact authored snapshot.
+            head_ref = final_ref
             self._put_head(head_ref, identity_payload, version=max(1, version))
         if envelope.operation in {"dat.content.link", "dat.content.unlink"}:
             association = envelope.payload.get("association")
@@ -838,7 +1012,29 @@ class _RuntimeGenericWriter(HerzchenRuntimeDomainOwner if HerzchenRuntimeDomainO
                     version=association_version,
                 )
                 self.store.conn.execute("INSERT OR IGNORE INTO herzchen_references(authority, kind, id, revision, created_at) VALUES (?, ?, ?, ?, ?)", (envelope.target.authority, envelope.target.kind, envelope.target.id, "", now()))
-        return self._store_generic_receipt(envelope, result, runtime_receipt=runtime_receipt, project_id=project_id, result_ref=final_ref)
+        transaction_id = str((runtime_receipt or {}).get("receipt_id") or ("txn-" + new_id()))
+        event_id = self._append_herzchen_event(
+            envelope,
+            event_type=str(event_type or envelope.operation),
+            result_ref=final_ref,
+            before_refs=before_refs,
+            after_refs=after_refs,
+            effects=effects,
+            stream=stream,
+            event_schema_revision=event_schema_revision,
+            occurred_at=occurred_at,
+            current_identity=current_identity,
+            transaction_id=transaction_id,
+        ) if not no_op else None
+        return self._store_generic_receipt(
+            envelope,
+            result,
+            runtime_receipt=runtime_receipt,
+            project_id=project_id,
+            result_ref=final_ref,
+            generic_event_ids=() if event_id is None else (event_id,),
+            transaction_id=transaction_id,
+        )
 
 
 @dataclass
@@ -932,6 +1128,8 @@ class RuntimeHerzchenBridge:
         self._generic_writer = _RuntimeGenericWriter(self)
         self.content = None
         self.extensions = None
+        self.managed_packs = None
+        self.authoring = None
         self.generic_contract_error = None
         try:
             if (
@@ -939,6 +1137,8 @@ class RuntimeHerzchenBridge:
                 or HerzchenDomainOwnerCapability is None
                 or content_domain_contribution is None
                 or extension_domain_contribution is None
+                or ManagedPackAuthoringHandler is None
+                or pack_authoring_domain_contribution is None
             ):
                 raise HerzchenUnavailable(
                     "the installed Herzchen package lacks the scoped Runtime domain-owner capability"
@@ -947,14 +1147,29 @@ class RuntimeHerzchenBridge:
             # admission set before either public DAT façade is composed.
             self._generic_writer.register_domain(content_domain_contribution())
             self._generic_writer.register_domain(extension_domain_contribution())
+            self._generic_writer.register_domain(pack_authoring_domain_contribution())
             content_owner = HerzchenDomainOwnerCapability.issue_runtime(
                 self._generic_writer, "dat.content"
             )
             extension_owner = HerzchenDomainOwnerCapability.issue_runtime(
                 self._generic_writer, "dat.extensions"
             )
+            pack_owner = HerzchenDomainOwnerCapability.issue_runtime(
+                self._generic_writer, "herzchen.packs.authoring"
+            )
             self.content = ContentCommandHandler(content_owner)
             self.extensions = ExtensionCommandService(extension_owner)
+            self.managed_packs = ManagedPackAuthoringHandler(pack_owner)
+            if (
+                AuthoringSessionService is not None
+                and authoring_domain_contribution is not None
+                and AuthoringLifecycle is not None
+            ):
+                self._generic_writer.register_domain(authoring_domain_contribution())
+                authoring_owner = HerzchenDomainOwnerCapability.issue_runtime(
+                    self._generic_writer, "herzchen.authoring.sessions"
+                )
+                self.authoring = AuthoringSessionService(authoring_owner)
         except (StoreAdmissionError, HerzchenUnavailable) as exc:
             # Keep the already-proven operation bridge usable while an older
             # shared installation lacks the scoped Runtime domain capability.
@@ -967,6 +1182,24 @@ class RuntimeHerzchenBridge:
     @property
     def actor(self) -> Any:
         return AuthenticatedActor(self.authority, self.actor_id, self.credential_ref)
+
+    def make_authoring_lifecycle(self, *, writer_leases: Any, writer_identity: str) -> Any:
+        """Compose EDT over this Runtime owner with an explicit host lease.
+
+        Runtime owns the durable authoring session and its event lineage.  The
+        checkout writer lease is deliberately supplied by the host that owns
+        the materialised files, so restart/cleanup custody is explicit rather
+        than silently backed by an ephemeral Runtime secret or store.
+        """
+        if self.authoring is None or AuthoringLifecycle is None:
+            raise HerzchenUnavailable("the installed Herzchen package lacks the public authoring lifecycle")
+        if writer_leases is None or not isinstance(writer_identity, str) or not writer_identity:
+            raise TypeError("writer_leases and writer_identity are required")
+        return AuthoringLifecycle(
+            self.authoring,
+            writer_leases=writer_leases,
+            writer_identity=writer_identity,
+        )
 
     def _ref(self, kind: str, value: str, *, revision: str | None = None) -> Any:
         return ResourceRef(self.authority, kind, str(value), revision)
