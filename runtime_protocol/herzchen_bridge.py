@@ -156,29 +156,57 @@ class RuntimeHerzchenBridge:
         *,
         request: Any,
         target: Any | None = None,
+        replayed: bool | None = None,
     ) -> RuntimeReceiptBinding | None:
         """Project a Runtime command receipt into Herzchen's receipt contract."""
         if not isinstance(result, Mapping):
             return None
         runtime_receipt = result.get("receipt")
+        if runtime_receipt is None and "receipt_id" in result:
+            runtime_receipt = result
         if not isinstance(runtime_receipt, Mapping):
             return None
-        target = target or request.target
+        if target is None:
+            raise TypeError("target is required when projecting a Runtime receipt")
         event_ids = tuple(str(value) for value in runtime_receipt.get("event_ids", ()))
+        raw_status = runtime_receipt.get("status", "committed")
+        try:
+            status = ReceiptStatus(raw_status)
+        except ValueError as exc:
+            raise ValueError(f"unsupported Runtime receipt status: {raw_status!r}") from exc
+        runtime_replayed = runtime_receipt.get("replayed", False)
+        if not isinstance(runtime_replayed, bool):
+            raise ValueError("Runtime receipt replayed field must be boolean when present")
+        if replayed is not None:
+            if not isinstance(replayed, bool):
+                raise TypeError("replayed must be boolean when supplied")
+            runtime_replayed = replayed
         project_seq = runtime_receipt.get("project_seq")
         observed_revision = None
         if isinstance(project_seq, (list, tuple)) and project_seq:
             observed_revision = f"runtime-seq-{int(project_seq[-1])}"
+        transaction_id = runtime_receipt.get("receipt_id", runtime_receipt.get("transaction_id"))
+        error_code = runtime_receipt.get("error_code")
+        unknown_reason = runtime_receipt.get("unknown_reason")
+        if status == ReceiptStatus.FAILED and not error_code:
+            raise ValueError("failed Runtime receipts require error_code")
+        if status == ReceiptStatus.UNKNOWN and not unknown_reason:
+            raise ValueError("unknown Runtime receipts require unknown_reason")
+        if status == ReceiptStatus.COMMITTED and not transaction_id:
+            raise ValueError("committed Runtime receipts require receipt_id or transaction_id")
         shared = CommandReceipt(
             request.logical_request_key,
             request.request_digest,
             request.operation,
             target,
-            ReceiptStatus.COMMITTED,
-            transaction_id=str(runtime_receipt["receipt_id"]),
+            status,
+            transaction_id=str(transaction_id) if transaction_id is not None else None,
             event_ids=event_ids,
-            result_ref=target,
+            result_ref=target if status in (ReceiptStatus.COMMITTED, ReceiptStatus.NOOP) else None,
+            error_code=str(error_code) if error_code is not None else None,
+            replayed=runtime_replayed,
             observed_revision=observed_revision,
+            unknown_reason=str(unknown_reason) if unknown_reason is not None else None,
         )
         return RuntimeReceiptBinding(shared, dict(runtime_receipt))
 

@@ -9,6 +9,11 @@ description = "Independent neutral local workspace runtime and bootstrap"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# Install the qualified shared contract wheel through the normal package
+# manager/wheelhouse boundary when enabling the Herzchen consumer binding.
+herzchen = ["herzchen-contracts==0.1.0"]
+
 [project.scripts]
 banodoco-runtime = "runtime_protocol.cli:main"
 banodoco-local = "banodoco_local.cli:main"

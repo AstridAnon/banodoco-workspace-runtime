@@ -49,6 +49,31 @@ def test_runtime_owner_consumes_shared_contracts_without_second_store() -> None:
             assert binding.shared_receipt.transaction_id == runtime_receipt["receipt_id"]
             assert binding.runtime_receipt["request_hash"] == runtime_receipt["request_hash"]
 
+            replay = bridge.receipt(
+                {
+                    "receipt_id": runtime_receipt["receipt_id"],
+                    "request_hash": runtime_receipt["request_hash"],
+                    "event_ids": [],
+                    "status": "committed",
+                    "replayed": True,
+                },
+                request=request,
+                target=project_ref,
+            )
+            assert replay is not None and replay.shared_receipt.replayed is True
+            failed = bridge.receipt(
+                {"receipt_id": "failure-1", "status": "failed", "error_code": "runtime_failed"},
+                request=request,
+                target=project_ref,
+            )
+            assert failed is not None and failed.shared_receipt.status.value == "failed"
+            unknown = bridge.receipt(
+                {"receipt_id": "unknown-1", "status": "unknown", "unknown_reason": "transport_lost"},
+                request=request,
+                target=project_ref,
+            )
+            assert unknown is not None and unknown.shared_receipt.status.value == "unknown"
+
             task_result = bridge.admit_task(
                 {
                     "capability_id": "bridge.cpu",
