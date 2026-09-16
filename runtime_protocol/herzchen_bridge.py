@@ -324,12 +324,16 @@ if HerzchenRuntimeOperationOwner is not None:
 
         def _task_for_operation(self, envelope: Any) -> Any:
             request_payload = envelope.payload.get("request_payload")
-            project_id = request_payload.get("project") if isinstance(request_payload, Mapping) else None
-            if not project_id:
+            project_selector = request_payload.get("project") if isinstance(request_payload, Mapping) else None
+            if not project_selector:
                 raise RuntimeOperationBindingError("Runtime operation is missing its project owner")
+            # workspace.v1 permits a project id or slug as a request selector.
+            # The durable run row stores the canonical project id, so resolve the
+            # selector at the Runtime owner boundary before locating the task.
+            project_id = self._store._project(str(project_selector))["id"]
             row = self._store.conn.execute(
                 "SELECT r.id AS run_id, t.id AS task_id FROM runs r JOIN tasks t ON t.run_id=r.id WHERE r.project_id=? AND r.idempotency_key=?",
-                (str(project_id), envelope.context.logical_request_key.split(":outcome", 1)[0]),
+                (project_id, envelope.context.logical_request_key.split(":outcome", 1)[0]),
             ).fetchone()
             if row is None:
                 raise RuntimeOperationBindingError("Runtime operation has no admitted Runtime task owner")
